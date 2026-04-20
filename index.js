@@ -7,13 +7,14 @@
     UPDATE: 'SAFE_HUD_UPDATE',
     PLAY: 'SAFE_HUD_PLAY',
     STOP_SEVERE: 'SAFE_HUD_STOP_SEVERE',
+    SETTINGS_CHANGED: 'SAFE_HUD_SETTINGS_CHANGED',
   };
 
   /** Ağır alarm sekansı bitene kadar (ms) — fiyat yukarı dönünce susturmak için; süre çarpanı ile uzar */
-  const SEVERE_PLAYBACK_WINDOW_MS = 7000;
+  const SEVERE_PLAYBACK_WINDOW_MS = 14000;
 
   /** Kayar pencere: son 3 dakikadaki zirveden bugüne düşüş (USD) alarm şiddetini belirler */
-  const PRICE_ROLLING_WINDOW_MS = 3 * 60 * 1000;
+  const PRICE_ROLLING_WINDOW_MS = 1 * 60 * 1000;
   /** Bu düşüşte tam “güçlü” ölçek kabul edilir (üstü daha da artar, tavan kodda) */
   const SEVERE_DROP_REF_USD = 200;
 
@@ -35,6 +36,7 @@
   };
 
   const STORAGE_KEY = 'safe_hud_settings_multi_v2';
+  const LAUNCHER_TOAST_ID = 'safe-hud-launcher-toast';
 
   const defaults = {
     walletFontSize: 64,
@@ -42,18 +44,20 @@
     coinFontSize: 28,
     hideOriginals: false,
 
-    hudWalletFontSize: 42,
-    hudCoinFontSize: 28,
-    hudPnlFontSize: 24,
-    hudPctFontSize: 16,
-    hudWidth: 330,
-    hudGap: 8,
+    hudWalletFontSize: 32,
+    hudCoinFontSize: 16,
+    hudPnlFontSize: 14,
+    hudPctFontSize: 15,
+    hudWidth: 220,
+    hudGap: 2,
 
     severeEnabled: true,
     happyEnabled: true,
-    severeVolume: 1.0,
-    happyVolume: 0.18,
-    severeStart: 1400,
+    /** @description 50’lik banda girince değil, band + bu USD (ör. 1500 → 1505+) ile yükseliş sesi */
+    happyUpBufferUsd: 5,
+    severeVolume: 0.06,
+    happyVolume: 0.06,
+    severeStart: 3000,
     severeStep: 50,
     rearmOffset: 5,
 
@@ -68,7 +72,7 @@
     pnlSelector: '',
 
     /** @description HUD pozisyon sırası: none | pnl-desc (kârdan zarara) | pnl-asc (zarardan kara) */
-    hudPnlSort: 'none',
+    hudPnlSort: 'pnl-desc',
 
     /** @description Ofis: görev çubuğu başlığı ve sade görünüm */
     privacyOfficeMode: false,
@@ -102,6 +106,12 @@
     severePlaybackUntil: 0,
     /** @description { t: epochMs, p: number } — son ~3 dk cüzdan örnekleri */
     priceHistory: [],
+    /** @description Tampon eşiği (örn. 1505) için ses çalındı; fiyat eşiğin altına inene kadar tekrar yok */
+    happyLatchedThresholds: new Set(),
+    /**
+     * @description Ağır alarm (severe) tetiklenene kadar yükseliş (happy) seslerini kapatır; yukarı trendde tekrar tekrar çalmasını önler.
+     */
+    happySilencedUntilSevere: false,
   };
 
   function save() {
@@ -159,6 +169,27 @@
     return getWalletElement()?.textContent?.trim() || '-';
   }
 
+  /**
+   * @description HUD cüzdan satırı: USD kaldırır, son `.` ve sonrasını (kuruş) göstermez.
+   */
+  function formatHudWalletDisplay(raw) {
+    let t = String(raw ?? '').trim();
+    if (!t || t === '-') return '-';
+    t = t.replace(/\bUSD\b/gi, '').replace(/\s+/g, ' ').trim();
+    const dot = t.lastIndexOf('.');
+    if (dot !== -1) {
+      t = t.slice(0, dot).trim();
+    }
+    return t || '-';
+  }
+
+  /** @description HUD’da renk işaret ettiği için + / - karakterlerini göstermez. */
+  function formatHudStripSignChars(raw) {
+    const t = String(raw ?? '').trim();
+    if (!t || t === '-') return '';
+    return t.replace(/[+\-]/g, '');
+  }
+
   function getWalletPrice() {
     return parseNumber(getWalletText());
   }
@@ -176,8 +207,8 @@
       const pctMatch = txt.match(/\(([+\-]?\d+(?:\.\d+)?%)\)/);
 
       return {
-        pnl: numMatch ? numMatch[1] : '-',
-        pct: pctMatch ? pctMatch[1] : '-',
+        pnl: numMatch ? numMatch[1] : '',
+        pct: pctMatch ? pctMatch[1] : '',
       };
     });
   }
@@ -212,8 +243,8 @@
     for (let i = 0; i < maxLen; i++) {
       result.push({
         coin: coins[i] || '-',
-        pnl: pnls[i]?.pnl || '-',
-        pct: pnls[i]?.pct || '-',
+        pnl: pnls[i]?.pnl || '',
+        pct: pnls[i]?.pct || '',
       });
     }
     return sortPositionsByPnlPreference(result, settings.hudPnlSort || 'none');
@@ -319,6 +350,7 @@
    */
   function emitPlaySound(sound, meta = {}) {
     if (sound === 'severe') {
+      state.happySilencedUntilSevere = false;
       const durationMul = meta.durationMul ?? 1;
       state.severePlaybackUntil = performance.now() + SEVERE_PLAYBACK_WINDOW_MS * durationMul;
       const play = {
@@ -334,6 +366,9 @@
       return;
     }
     if (sound === 'happy') {
+      if (settings.severeEnabled) {
+        state.happySilencedUntilSevere = true;
+      }
       const play = { sound: 'happy' };
       if (state.popupPollsOpener) {
         state.pendingSounds.push(play);
@@ -385,21 +420,55 @@
     }
   }
 
+  /**
+   * @description 50 USD’lik yükseliş bandında ses: yalnızca `band + tampon` üstüne çıkınca (ör. 1500 → en az 1505). Sınırı yalayarak tekrar çalmasın diye tampon eşiği latch’lenir.
+   * @param prevPrice - Bir önceki tick cüzdan USD
+   * @param currentPrice - Şimdiki tick
+   */
   function checkHappy50Up(prevPrice, currentPrice) {
     if (prevPrice == null || currentPrice == null) return;
+
+    const bufRaw = Number(settings.happyUpBufferUsd);
+    const buf =
+      Number.isFinite(bufRaw) && bufRaw >= 0 ? Math.min(100, bufRaw) : 5;
+
+    for (const thr of [...state.happyLatchedThresholds]) {
+      if (currentPrice < thr) {
+        state.happyLatchedThresholds.delete(thr);
+      }
+    }
+
+    if (!settings.happyEnabled) return;
+
     if (!(currentPrice > prevPrice)) return;
+
+    if (settings.severeEnabled && state.happySilencedUntilSevere) {
+      return;
+    }
 
     const prev50 = Math.floor(prevPrice / 50) * 50;
     const curr50 = Math.floor(currentPrice / 50) * 50;
-    if (curr50 > prev50) {
-      /** Büyük sıçramada onlarca “mutlu” üst üste binmesin; tick başına en fazla 3. */
-      let happyCount = 0;
-      const maxHappyPerTick = 3;
-      for (let level = prev50 + 50; level <= curr50; level += 50) {
-        if (happyCount >= maxHappyPerTick) break;
+
+    /** Büyük sıçramada onlarca “mutlu” üst üste binmesin; tick başına en fazla 3. */
+    let happyCount = 0;
+    const maxHappyPerTick = 3;
+
+    const tryEmitForThreshold = (threshold) => {
+      if (happyCount >= maxHappyPerTick) return;
+      if (state.happyLatchedThresholds.has(threshold)) return;
+      if (prevPrice < threshold && currentPrice >= threshold) {
         emitPlaySound('happy');
+        state.happyLatchedThresholds.add(threshold);
         happyCount += 1;
       }
+    };
+
+    if (curr50 > prev50) {
+      for (let level = prev50 + 50; level <= curr50; level += 50) {
+        tryEmitForThreshold(level + buf);
+      }
+    } else if (curr50 === prev50) {
+      tryEmitForThreshold(curr50 + buf);
     }
   }
 
@@ -408,6 +477,7 @@
    */
   window.safeHudRearmFromSevereSlider = () => {
     state.armedLevels.clear();
+    state.happySilencedUntilSevere = false;
     const currentPrice = getWalletPrice();
     if (currentPrice != null) {
       updateArmedLevels(currentPrice);
@@ -421,13 +491,29 @@
   window.safeHudGetWalletPrice = () => getWalletPrice();
 
   /**
-   * @description Popup için ortak stiller (bir kez head’e eklenir).
+   * @description Popup’tan “ölçekli uyarı” testi: opener’daki son 3 dk fiyat geçmişi + anlık cüzdan ile aynı çarpanlar.
+   * @returns intensityMul, durationMul, dropUsd
    */
-  function injectPopupChromeStyles(doc) {
-    if (doc.getElementById('safe-popup-chrome-css')) return;
-    const st = doc.createElement('style');
-    st.id = 'safe-popup-chrome-css';
-    st.textContent = `
+  window.safeHudGetSevereTestScaling = () => {
+    try {
+      loadSettingsIntoSettings();
+      const p = getWalletPrice();
+      if (p == null || !Number.isFinite(p)) {
+        return { intensityMul: 1, durationMul: 1, dropUsd: 0 };
+      }
+      const dropUsd = getDropUsdInRollingWindow(p, PRICE_ROLLING_WINDOW_MS);
+      const scale = computeSevereScalingFromDrop(dropUsd);
+      return { ...scale, dropUsd };
+    } catch (e) {
+      return { intensityMul: 1, durationMul: 1, dropUsd: 0 };
+    }
+  };
+
+  /**
+   * @description Popup ve ana sayfa ayar paneli için ortak CSS metni.
+   */
+  function getSafeHudChromeCss() {
+    return `
       #sh-app { min-height:100vh; background:var(--sh-bg,#0f1419); color:var(--sh-text,#e8eaed); }
       #sh-app.sh-privacy { --sh-up:#aab4c5; --sh-down:#aab4c5; }
       :root { --sh-bg:#0f1419; --sh-card:#151c26; --sh-card2:#1c2636; --sh-line:#2a3548; --sh-text:#e8eaed; --sh-muted:#8b98ab; --sh-accent:#2f6fbe; --sh-up:#3ecf8e; --sh-down:#f07178; }
@@ -436,7 +522,7 @@
       .sh-top-left { display:flex; align-items:center; gap:12px; min-width:0; }
       .sh-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; background:linear-gradient(135deg,#5ad48f,var(--sh-accent)); box-shadow:0 0 14px rgba(47,111,190,0.35); }
       .sh-top-title { font-size:15px; font-weight:650; letter-spacing:-0.02em; }
-      .sh-top-hint { font-size:11px; color:var(--sh-muted); max-width:280px; line-height:1.35; }
+      .sh-top-hint { font-size:11px; color:var(--sh-muted); max-width:min(380px,92vw); line-height:1.35; }
       .sh-btn { border:0; border-radius:10px; padding:9px 14px; font-size:13px; font-weight:600; cursor:pointer; transition:opacity .15s, transform .1s; }
       .sh-btn:active { transform:scale(0.98); }
       .sh-btn-primary { background:linear-gradient(180deg,#3a7bd5,#2a5fad); color:#fff; box-shadow:0 4px 14px rgba(42,95,173,0.35); }
@@ -448,18 +534,41 @@
       .sh-grid { display:grid; grid-template-columns:1fr auto; gap:10px 12px; align-items:center; font-size:13px; }
       .sh-grid label { color:var(--sh-muted); }
       .sh-inp, .sh-select { width:100%; max-width:100%; padding:8px 10px; border-radius:8px; border:1px solid var(--sh-line); background:#0d1219; color:var(--sh-text); box-sizing:border-box; font-size:13px; }
-      .sh-hud { margin:0 16px 20px; padding:16px 18px; background:linear-gradient(180deg,#121a24,#0e141c); border:1px solid var(--sh-line); border-radius:16px; box-sizing:border-box;
+      .sh-hud { margin:0 16px 20px; padding:16px 18px; background:linear-gradient(180deg,#121a24,#0e141c); border:1px solid var(--sh-line); border-radius:16px; box-sizing:border-box; overflow:hidden;
         box-shadow:0 8px 32px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.03); }
       .sh-hud-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--sh-muted); margin-bottom:8px; }
       .sh-hud-wallet { font-weight:800; line-height:1.08; margin-bottom:12px; letter-spacing:-0.02em; }
-      .sh-row { display:flex; justify-content:space-between; align-items:flex-end; gap:10px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.06); }
+      #safe-hud-positions { width:100%; max-width:100%; min-width:0; box-sizing:border-box; }
+      .sh-row { display:flex; justify-content:space-between; align-items:flex-end; gap:10px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.06);
+        width:100%; max-width:100%; min-width:0; box-sizing:border-box; overflow:hidden; }
       .sh-row:last-child { border-bottom:0; }
       .sh-status { margin-top:12px; font-size:11px; color:var(--sh-muted); }
     `;
+  }
+
+  /**
+   * @description Ortak stilleri belirtilen belgeye bir kez enjekte eder.
+   */
+  function injectChromeStylesDoc(doc, styleId) {
+    if (doc.getElementById(styleId)) return;
+    const st = doc.createElement('style');
+    st.id = styleId;
+    st.textContent = getSafeHudChromeCss();
     doc.head.appendChild(st);
   }
 
-  function buildPopupMarkup(s) {
+  function injectPopupChromeStyles(doc) {
+    injectChromeStylesDoc(doc, 'safe-popup-chrome-css');
+  }
+
+  function injectMainChromeStyles(doc) {
+    injectChromeStylesDoc(doc, 'safe-hud-main-chrome-css');
+  }
+
+  /**
+   * @description Ana penceredeki ayar formunun HTML’i (sadece gövde içeriği).
+   */
+  function buildMainSettingsFormHtml(s) {
     const wSel = String(s.walletSelector || '')
       .replace(/&/g, '&amp;')
       .replace(/"/g, '&quot;')
@@ -478,23 +587,6 @@
       .replace(/</g, '&lt;');
 
     return `
-<div id="sh-app" class="${s.privacyOfficeMode ? 'sh-privacy' : ''}">
-<div class="sh-top">
-  <div class="sh-top-left">
-    <span class="sh-dot" aria-hidden="true"></span>
-    <div style="min-width:0;">
-      <div class="sh-top-title">Özet paneli</div>
-      <div class="sh-top-hint">Veri kaynak sekmesinden gelir. Ses için bu pencerede bir kez tıklayın.</div>
-    </div>
-  </div>
-  <button type="button" class="sh-btn sh-btn-primary" id="safe-popup-focus-opener">Kaynak sekmesi</button>
-</div>
-<div id="safe-hud-panel" class="sh-card">
-  <div id="safe-panel-header" class="sh-card-h">
-    <strong>Ayarlar</strong>
-    <button type="button" id="safe-panel-toggle" class="sh-btn sh-btn-quiet" style="padding:6px 12px;">${s.panelCollapsed ? 'Aç' : 'Daralt'}</button>
-  </div>
-  <div id="safe-panel-body" class="sh-card-body" style="display:${s.panelCollapsed ? 'none' : 'block'};">
     <p style="margin:0 0 12px;font-size:12px;color:var(--sh-muted);line-height:1.45;">Seçiciler boşsa varsayılan site yolları kullanılır.</p>
     <label style="display:block;font-size:11px;color:var(--sh-muted);margin-bottom:4px;">Cüzdan CSS</label>
     <input id="safe-wallet-selector" class="sh-inp" type="text" value="${wSel}" placeholder="Boş = varsayılan yol" style="margin-bottom:10px;">
@@ -505,7 +597,9 @@
 
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-happy">Ses testi (yükseliş)</button>
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe">Ses testi (uyarı)</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe" title="Sabit 1× şiddet / süre">Uyarı (basit)</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-scaled" title="Kaynak sekmede son 3 dk düşüşüne göre">Uyarı (ölçekli)</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-demo-max" title="Yaklaşık maksimum süre ve şiddet">Uyarı (max örnek)</button>
     </div>
 
     <div class="sh-grid">
@@ -522,6 +616,11 @@
       <input id="safe-severe-enabled" type="checkbox" ${s.severeEnabled ? 'checked' : ''}>
       <label>50 yükseliş sesi</label>
       <input id="safe-happy-enabled" type="checkbox" ${s.happyEnabled ? 'checked' : ''}>
+      <label>Yükseliş tamponu (USD)</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-happy-buffer" type="range" min="0" max="25" step="1" value="${Number.isFinite(s.happyUpBufferUsd) ? s.happyUpBufferUsd : 5}">
+        <span id="safe-happy-buffer-val">${Number.isFinite(s.happyUpBufferUsd) ? s.happyUpBufferUsd : 5}</span>
+      </div>
       <label>Ağır ses</label>
       <div style="display:flex;align-items:center;gap:8px;">
         <input id="safe-severe-volume" type="range" min="0" max="1" step="0.01" value="${s.severeVolume}">
@@ -573,16 +672,275 @@
         <input id="safe-severe-start" type="range" min="500" max="3000" step="50" value="${s.severeStart}">
         <span id="safe-severe-start-val">${s.severeStart}</span>
       </div>
-    </div>
+    </div>`;
+  }
+
+  /**
+   * @description Yalnızca canlı özet HUD’u (ikinci pencere).
+   */
+  function buildHudPopupHtml(s) {
+    return `
+<div id="sh-app" class="${s.privacyOfficeMode ? 'sh-privacy' : ''}">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 14px;background:var(--sh-card);border-bottom:1px solid var(--sh-line);">
+    <span style="font-size:12px;color:var(--sh-muted);">Ses için tıklayın</span>
+    <button type="button" class="sh-btn sh-btn-primary" id="safe-popup-focus-opener" style="padding:6px 12px;font-size:12px;">Kaynak sekmesi</button>
   </div>
-</div>
-<div id="safe-hud-display" class="sh-hud" style="width:${s.hudWidth}px;">
-  <div class="sh-hud-label" id="safe-hud-main-label">Canlı özet</div>
-  <div id="safe-hud-wallet" class="sh-hud-wallet">-</div>
-  <div id="safe-hud-positions" style="display:flex;flex-direction:column;gap:${s.hudGap}px;"></div>
-  <div id="safe-hud-status" class="sh-status"></div>
-</div>
+  <div id="safe-hud-display" class="sh-hud" style="width:${s.hudWidth}px;margin:12px auto 16px;">
+    <div class="sh-hud-label" id="safe-hud-main-label">Canlı özet</div>
+    <div id="safe-hud-wallet" class="sh-hud-wallet">-</div>
+    <div id="safe-hud-positions" style="display:flex;flex-direction:column;gap:${s.hudGap}px;width:100%;max-width:100%;min-width:0;box-sizing:border-box;"></div>
+    <div id="safe-hud-status" class="sh-status"></div>
+  </div>
 </div>`;
+  }
+
+  /**
+   * @description Ayarlar kaydedilince ana bellek + HUD penceresi güncellenir.
+   */
+  function notifyHudSettingsChanged() {
+    loadSettingsIntoSettings();
+    try {
+      const w = state.hudWindow;
+      if (w && !w.closed) {
+        w.postMessage({ type: MSG.SETTINGS_CHANGED }, '*');
+      }
+    } catch (e) {}
+  }
+
+  /**
+   * @description HUD’a ses çalmayı iletir (Web Audio HUD penceresindedir).
+   */
+  function postSoundToHudWindow(playMsg) {
+    try {
+      const w = state.hudWindow;
+      if (!w || w.closed) {
+        showSafeHudLauncherToast('Önce HUD penceresini açın; ses orada çalar.');
+        return;
+      }
+      w.postMessage(playMsg, '*');
+    } catch (e2) {
+      showSafeHudLauncherToast('HUD penceresine mesaj gönderilemedi.');
+    }
+  }
+
+  /**
+   * @description Ana sayfada açılır-kapanır ayar paneli (veri sekmesi).
+   */
+  function createMainSettingsPanel() {
+    document.getElementById('safe-hud-main-settings-wrap')?.remove();
+    loadSettingsIntoSettings();
+    const s = { ...defaults, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') };
+    injectMainChromeStyles(document);
+
+    const wrap = document.createElement('div');
+    wrap.id = 'safe-hud-main-settings-wrap';
+    wrap.style.cssText = [
+      'position:fixed',
+      'left:12px',
+      'right:12px',
+      'bottom:58px',
+      'z-index:2147483645',
+      'max-width:min(520px,calc(100vw - 24px))',
+      'max-height:min(72vh,calc(100vh - 120px))',
+      'display:flex',
+      'flex-direction:column',
+      'pointer-events:auto',
+      'font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
+    ].join(';');
+
+    const collapsed = !!s.panelCollapsed;
+    wrap.innerHTML = `
+      <div class="sh-card" style="margin:0;display:flex;flex-direction:column;max-height:100%;overflow:hidden;">
+        <div class="sh-card-h" style="flex-shrink:0;">
+          <strong>HUD ayarları</strong>
+          <button type="button" id="safe-main-panel-toggle" class="sh-btn sh-btn-quiet" style="padding:6px 12px;">${collapsed ? 'Aç' : 'Daralt'}</button>
+        </div>
+        <div id="safe-main-settings-body" class="sh-card-body" style="overflow-y:auto;flex:1;min-height:0;display:${collapsed ? 'none' : 'block'};">
+          ${buildMainSettingsFormHtml(s)}
+        </div>
+      </div>`;
+    document.body.appendChild(wrap);
+
+    const bodyEl = document.getElementById('safe-main-settings-body');
+    const toggleBtn = document.getElementById('safe-main-panel-toggle');
+
+    const readMainPanelSettings = () => {
+      try {
+        return { ...defaults, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') };
+      } catch {
+        return { ...defaults };
+      }
+    };
+
+    const refreshHudPreviewMain = () => {
+      notifyHudSettingsChanged();
+    };
+
+    toggleBtn.onclick = () => {
+      const st = readMainPanelSettings();
+      st.panelCollapsed = !st.panelCollapsed;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      const nowCollapsed = st.panelCollapsed;
+      bodyEl.style.display = nowCollapsed ? 'none' : 'block';
+      toggleBtn.textContent = nowCollapsed ? 'Aç' : 'Daralt';
+      notifyHudSettingsChanged();
+    };
+
+    const bindCheckMain = (id, key) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.onchange = (e) => {
+        const st = readMainPanelSettings();
+        st[key] = e.target.checked;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        notifyHudSettingsChanged();
+      };
+    };
+    bindCheckMain('safe-hide-originals', 'hideOriginals');
+    bindCheckMain('safe-severe-enabled', 'severeEnabled');
+    bindCheckMain('safe-happy-enabled', 'happyEnabled');
+
+    const poEl = document.getElementById('safe-privacy-office');
+    if (poEl) {
+      poEl.onchange = (e) => {
+        const st = readMainPanelSettings();
+        st.privacyOfficeMode = e.target.checked;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        refreshHudPreviewMain();
+      };
+    }
+    const pmEl = document.getElementById('safe-privacy-mask');
+    if (pmEl) {
+      pmEl.onchange = (e) => {
+        const st = readMainPanelSettings();
+        st.maskRowLabels = e.target.checked;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        refreshHudPreviewMain();
+      };
+    }
+    const dtEl = document.getElementById('safe-discreet-title');
+    if (dtEl) {
+      const commitDiscreetTitle = () => {
+        const st = readMainPanelSettings();
+        st.discreetWindowTitle = dtEl.value.trim() || 'Çalışma özeti';
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        refreshHudPreviewMain();
+      };
+      dtEl.addEventListener('change', commitDiscreetTitle);
+      dtEl.addEventListener('blur', commitDiscreetTitle);
+    }
+
+    const commitSelectors = () => {
+      const st = readMainPanelSettings();
+      st.walletSelector = document.getElementById('safe-wallet-selector').value.trim();
+      st.coinSelector = document.getElementById('safe-coin-selector').value.trim();
+      st.pnlSelector = document.getElementById('safe-pnl-selector').value.trim();
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      try {
+        if (window.safeHudInvalidateDom) window.safeHudInvalidateDom();
+      } catch (e) {}
+      notifyHudSettingsChanged();
+    };
+    ['safe-wallet-selector', 'safe-coin-selector', 'safe-pnl-selector'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.addEventListener('change', commitSelectors);
+        el.addEventListener('blur', commitSelectors);
+      }
+    });
+
+    document.getElementById('safe-severe-volume').oninput = (e) => {
+      const st = readMainPanelSettings();
+      st.severeVolume = parseFloat(e.target.value);
+      document.getElementById('safe-severe-volume-val').textContent = st.severeVolume.toFixed(2);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      notifyHudSettingsChanged();
+    };
+    document.getElementById('safe-happy-volume').oninput = (e) => {
+      const st = readMainPanelSettings();
+      st.happyVolume = parseFloat(e.target.value);
+      document.getElementById('safe-happy-volume-val').textContent = st.happyVolume.toFixed(2);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      notifyHudSettingsChanged();
+    };
+    document.getElementById('safe-happy-buffer').oninput = (e) => {
+      const st = readMainPanelSettings();
+      st.happyUpBufferUsd = parseInt(e.target.value, 10);
+      document.getElementById('safe-happy-buffer-val').textContent = String(st.happyUpBufferUsd);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      notifyHudSettingsChanged();
+    };
+
+    document.getElementById('safe-severe-start').oninput = (e) => {
+      const st = readMainPanelSettings();
+      st.severeStart = parseInt(e.target.value, 10);
+      document.getElementById('safe-severe-start-val').textContent = String(st.severeStart);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      try {
+        if (window.safeHudRearmFromSevereSlider) window.safeHudRearmFromSevereSlider();
+      } catch (err) {}
+      notifyHudSettingsChanged();
+    };
+
+    const bindRangeMain = (id, key, suffix = 'px') => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.oninput = (e) => {
+        const st = readMainPanelSettings();
+        st[key] = parseInt(e.target.value, 10);
+        const val = document.getElementById(`${id}-val`);
+        if (val) val.textContent = `${st[key]}${suffix}`;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        notifyHudSettingsChanged();
+      };
+    };
+    bindRangeMain('safe-coin-font', 'hudCoinFontSize');
+    bindRangeMain('safe-pnl-font', 'hudPnlFontSize');
+    bindRangeMain('safe-pct-font', 'hudPctFontSize');
+    bindRangeMain('safe-wallet-font', 'hudWalletFontSize');
+    bindRangeMain('safe-hud-width', 'hudWidth');
+    bindRangeMain('safe-hud-gap', 'hudGap');
+
+    const pnlSortEl = document.getElementById('safe-hud-pnl-sort');
+    if (pnlSortEl) {
+      pnlSortEl.onchange = () => {
+        const st = readMainPanelSettings();
+        st.hudPnlSort = pnlSortEl.value;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        refreshHudPreviewMain();
+      };
+    }
+
+    document.getElementById('safe-test-happy').onclick = () => {
+      postSoundToHudWindow({ type: MSG.PLAY, sound: 'happy', force: true });
+    };
+    document.getElementById('safe-test-severe').onclick = () => {
+      postSoundToHudWindow({ type: MSG.PLAY, sound: 'severe', force: true });
+    };
+    document.getElementById('safe-test-severe-scaled').onclick = () => {
+      let sc = { intensityMul: 1, durationMul: 1 };
+      try {
+        if (typeof window.safeHudGetSevereTestScaling === 'function') {
+          sc = window.safeHudGetSevereTestScaling();
+        }
+      } catch (e) {}
+      postSoundToHudWindow({
+        type: MSG.PLAY,
+        sound: 'severe',
+        force: true,
+        intensityMul: sc.intensityMul,
+        durationMul: sc.durationMul,
+      });
+    };
+    document.getElementById('safe-test-severe-demo-max').onclick = () => {
+      postSoundToHudWindow({
+        type: MSG.PLAY,
+        sound: 'severe',
+        force: true,
+        intensityMul: 2.2,
+        durationMul: 2.05,
+      });
+    };
   }
 
   /**
@@ -604,7 +962,7 @@
       win.__safeHudPopupClickUnlock = null;
     }
 
-    root.innerHTML = buildPopupMarkup(readSettings());
+    root.innerHTML = buildHudPopupHtml(readSettings());
 
     const audioState = {
       ctx: null,
@@ -652,19 +1010,23 @@
       if (!ctx) return;
       const start = ctx.currentTime;
       const comp = compressor(ctx, -20, 8);
+      const gap = 0.34;
+      const atk = 0.04;
+      const sustainEnd = 0.72;
+      const stopAt = 0.82;
       [523.25, 659.25, 783.99].forEach((freq, i) => {
-        const t = start + i * 0.13;
+        const t = start + i * gap;
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
         osc.type = 'sine';
         osc.frequency.setValueAtTime(freq, t);
         gain.gain.setValueAtTime(0.0001, t);
-        gain.gain.exponentialRampToValueAtTime(s.happyVolume, t + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+        gain.gain.exponentialRampToValueAtTime(s.happyVolume, t + atk);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + sustainEnd);
         osc.connect(gain);
         gain.connect(comp);
         osc.start(t);
-        osc.stop(t + 0.24);
+        osc.stop(t + stopAt);
       });
     }
 
@@ -693,7 +1055,7 @@
       const durM = Math.min(2.2, Math.max(0.85, Number(opts.durationMul) || 1));
 
       const nowWall = performance.now();
-      const cooldownMs = Math.round(6200 * durM);
+      const cooldownMs = Math.round(11500 * durM);
       if (!opts.force && audioState.severeCooldownUntil > nowWall) {
         return;
       }
@@ -703,9 +1065,12 @@
       const start = ctx.currentTime;
       const compRatio = Math.min(22, 16 + intM * 2.2);
       const comp = compressor(ctx, -8 - intM * 1.5, compRatio);
-      const oscCount = Math.min(96, Math.round(34 * durM + 6));
-      const stepSec = 0.17 / Math.max(0.82, Math.sqrt(intM));
+      const oscCount = Math.min(110, Math.round(42 * durM + 8));
+      const stepSec = 0.2 / Math.max(0.82, Math.sqrt(intM));
       const volPeak = Math.min(1.28, s.severeVolume * intM);
+      const pulseAttack = 0.014;
+      const pulseDecayEnd = 0.52;
+      const pulseStop = 0.62;
 
       for (let i = 0; i < oscCount; i++) {
         const t = start + i * stepSec;
@@ -714,12 +1079,12 @@
         osc.type = i % 3 === 0 ? 'square' : i % 3 === 1 ? 'sawtooth' : 'triangle';
         osc.frequency.setValueAtTime(i % 2 === 0 ? 1600 : 900, t);
         gain.gain.setValueAtTime(0.0001, t);
-        gain.gain.exponentialRampToValueAtTime(volPeak, t + 0.008);
-        gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+        gain.gain.exponentialRampToValueAtTime(volPeak, t + pulseAttack);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + pulseDecayEnd);
         osc.connect(gain);
         gain.connect(comp);
         osc.start(t);
-        osc.stop(t + 0.2);
+        osc.stop(t + pulseStop);
         audioState.severeStopHandles.push(() => {
           try {
             osc.stop(0);
@@ -791,12 +1156,16 @@
       if (hudBox) hudBox.style.width = `${s.hudWidth}px`;
 
       if (walletEl) {
-        walletEl.textContent = payload.wallet || '-';
+        walletEl.textContent = formatHudWalletDisplay(payload.wallet);
         walletEl.style.fontSize = `${s.hudWalletFontSize}px`;
         walletEl.style.color = privacy ? officeMuted : neutral;
       }
       if (positionsEl) {
         positionsEl.style.gap = `${s.hudGap}px`;
+        positionsEl.style.width = '100%';
+        positionsEl.style.maxWidth = '100%';
+        positionsEl.style.minWidth = '0';
+        positionsEl.style.boxSizing = 'border-box';
         positionsEl.innerHTML = '';
         const sortMode = s.hudPnlSort || 'none';
         const rows = sortHudRowsForDisplay(payload.positions || [], sortMode);
@@ -819,21 +1188,25 @@
           left.style.cssText = `font-weight:800;font-size:${s.hudCoinFontSize}px;line-height:1;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${rowTone};`;
           const rightWrap = d.createElement('div');
           rightWrap.style.cssText =
-            'display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex-shrink:0;';
+            'display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex:0 1 auto;min-width:0;max-width:58%;';
           const pnl = d.createElement('div');
-          pnl.textContent = pos.pnl || '-';
+          const pnlShown = formatHudStripSignChars(pos.pnl);
+          pnl.textContent = pnlShown;
           let pnlColor = rowTone;
           if (privacy && pnlNum != null) {
             if (pnlNum > 0) pnlColor = '#8daf9e';
             else if (pnlNum < 0) pnlColor = '#b89a9a';
             else pnlColor = officeMuted;
           }
-          pnl.style.cssText = `font-weight:700;font-size:${s.hudPnlFontSize}px;line-height:1;color:${pnlColor};`;
-          const pct = d.createElement('div');
-          pct.textContent = pos.pct || '-';
-          pct.style.cssText = `font-weight:600;opacity:0.92;font-size:${s.hudPctFontSize}px;line-height:1;color:${pnlColor};`;
+          pnl.style.cssText = `font-weight:700;font-size:${s.hudPnlFontSize}px;line-height:1;color:${pnlColor};max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`;
+          const pctShown = formatHudStripSignChars(pos.pct);
           rightWrap.appendChild(pnl);
-          rightWrap.appendChild(pct);
+          if (pctShown) {
+            const pct = d.createElement('div');
+            pct.textContent = pctShown;
+            pct.style.cssText = `font-weight:600;opacity:0.92;font-size:${s.hudPctFontSize}px;line-height:1;color:${pnlColor};max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`;
+            rightWrap.appendChild(pct);
+          }
           row.appendChild(left);
           row.appendChild(rightWrap);
           positionsEl.appendChild(row);
@@ -855,13 +1228,17 @@
         audioState.severeCooldownUntil = 0;
         return;
       }
+      if (ev.data?.type === MSG.SETTINGS_CHANGED) {
+        refreshHudPreview();
+        return;
+      }
       if (ev.data?.type === MSG.UPDATE) applyUpdate(ev.data.payload || {});
       if (ev.data?.type === MSG.PLAY) {
         const s = readSettings();
         unlockAudio().then(() => {
           if (ev.data.sound === 'severe') {
             playSevere(s, {
-              force: false,
+              force: !!ev.data.force,
               intensityMul: ev.data.intensityMul,
               durationMul: ev.data.durationMul,
             });
@@ -881,132 +1258,6 @@
       try {
         if (win.opener && !win.opener.closed) win.opener.focus();
       } catch (e) {}
-    };
-
-    d.getElementById('safe-panel-toggle').onclick = () => {
-      const s = readSettings();
-      s.panelCollapsed = !s.panelCollapsed;
-      win.localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
-      mountPopup(win);
-    };
-
-    const bindCheck = (id, key) => {
-      const el = d.getElementById(id);
-      if (!el) return;
-      el.onchange = (e) => {
-        const s = readSettings();
-        s[key] = e.target.checked;
-        win.localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
-      };
-    };
-    bindCheck('safe-hide-originals', 'hideOriginals');
-    bindCheck('safe-severe-enabled', 'severeEnabled');
-    bindCheck('safe-happy-enabled', 'happyEnabled');
-
-    const poEl = d.getElementById('safe-privacy-office');
-    if (poEl) {
-      poEl.onchange = (e) => {
-        const st = readSettings();
-        st.privacyOfficeMode = e.target.checked;
-        win.localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-        refreshHudPreview();
-      };
-    }
-    const pmEl = d.getElementById('safe-privacy-mask');
-    if (pmEl) {
-      pmEl.onchange = (e) => {
-        const st = readSettings();
-        st.maskRowLabels = e.target.checked;
-        win.localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-        refreshHudPreview();
-      };
-    }
-    const dtEl = d.getElementById('safe-discreet-title');
-    if (dtEl) {
-      const commitDiscreetTitle = () => {
-        const st = readSettings();
-        st.discreetWindowTitle = dtEl.value.trim() || 'Çalışma özeti';
-        win.localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-        refreshHudPreview();
-      };
-      dtEl.addEventListener('change', commitDiscreetTitle);
-      dtEl.addEventListener('blur', commitDiscreetTitle);
-    }
-
-    const commitSelectors = () => {
-      const s = readSettings();
-      s.walletSelector = d.getElementById('safe-wallet-selector').value.trim();
-      s.coinSelector = d.getElementById('safe-coin-selector').value.trim();
-      s.pnlSelector = d.getElementById('safe-pnl-selector').value.trim();
-      win.localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
-      try {
-        if (win.opener && win.opener.safeHudInvalidateDom) win.opener.safeHudInvalidateDom();
-      } catch (e) {}
-    };
-    ['safe-wallet-selector', 'safe-coin-selector', 'safe-pnl-selector'].forEach((id) => {
-      const el = d.getElementById(id);
-      if (el) {
-        el.addEventListener('change', commitSelectors);
-        el.addEventListener('blur', commitSelectors);
-      }
-    });
-
-    d.getElementById('safe-severe-volume').oninput = (e) => {
-      const s = readSettings();
-      s.severeVolume = parseFloat(e.target.value);
-      d.getElementById('safe-severe-volume-val').textContent = s.severeVolume.toFixed(2);
-      win.localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
-    };
-    d.getElementById('safe-happy-volume').oninput = (e) => {
-      const s = readSettings();
-      s.happyVolume = parseFloat(e.target.value);
-      d.getElementById('safe-happy-volume-val').textContent = s.happyVolume.toFixed(2);
-      win.localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
-    };
-
-    d.getElementById('safe-severe-start').oninput = (e) => {
-      const s = readSettings();
-      s.severeStart = parseInt(e.target.value, 10);
-      d.getElementById('safe-severe-start-val').textContent = String(s.severeStart);
-      win.localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
-      try {
-        if (win.opener && win.opener.safeHudRearmFromSevereSlider) win.opener.safeHudRearmFromSevereSlider();
-      } catch (err) {}
-    };
-
-    const bindRange = (id, key, suffix = 'px') => {
-      const el = d.getElementById(id);
-      if (!el) return;
-      el.oninput = (e) => {
-        const s = readSettings();
-        s[key] = parseInt(e.target.value, 10);
-        const val = d.getElementById(`${id}-val`);
-        if (val) val.textContent = `${s[key]}${suffix}`;
-        win.localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
-      };
-    };
-    bindRange('safe-coin-font', 'hudCoinFontSize');
-    bindRange('safe-pnl-font', 'hudPnlFontSize');
-    bindRange('safe-pct-font', 'hudPctFontSize');
-    bindRange('safe-wallet-font', 'hudWalletFontSize');
-    bindRange('safe-hud-width', 'hudWidth');
-    bindRange('safe-hud-gap', 'hudGap');
-
-    const pnlSortEl = d.getElementById('safe-hud-pnl-sort');
-    if (pnlSortEl) {
-      pnlSortEl.onchange = () => {
-        const st = readSettings();
-        st.hudPnlSort = pnlSortEl.value;
-        win.localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-        refreshHudPreview();
-      };
-    }
-
-    d.getElementById('safe-test-happy').onclick = () => {
-      unlockAudio().then(() => playHappy(readSettings()));
-    };
-    d.getElementById('safe-test-severe').onclick = () => {
-      unlockAudio().then(() => playSevere(readSettings(), { force: true }));
     };
 
     try {
@@ -1034,7 +1285,7 @@
     const w = window.open(
       '',
       POPUP_WINDOW_NAME,
-      'width=460,height=820,scrollbars=yes,resizable=yes',
+      'width=300,height=720,scrollbars=yes,resizable=yes',
     );
     if (!w) {
       showPopupBlockedHelp();
@@ -1054,7 +1305,7 @@
       try {
         if (w.closed) return;
         const root = w.document.getElementById('safe-popup-root');
-        if (root && !root.querySelector('#safe-hud-panel')) {
+        if (root && !root.querySelector('#safe-hud-display')) {
           mountPopup(w);
         }
       } catch (e) {}
@@ -1150,12 +1401,46 @@
     });
   }
 
+  /**
+   * @description Kısa bilgi balonu (sol alt).
+   */
+  function showSafeHudLauncherToast(message) {
+    try {
+      document.getElementById(LAUNCHER_TOAST_ID)?.remove();
+      const t = document.createElement('div');
+      t.id = LAUNCHER_TOAST_ID;
+      t.textContent = message;
+      t.style.cssText = [
+        'position:fixed',
+        'left:12px',
+        'bottom:88px',
+        'z-index:2147483646',
+        'max-width:min(480px,calc(100vw - 24px))',
+        'padding:12px 14px',
+        'background:rgba(18,26,38,0.98)',
+        'color:#eef2f8',
+        'border-radius:12px',
+        'font-size:12px',
+        'line-height:1.5',
+        'box-shadow:0 10px 36px rgba(0,0,0,0.45)',
+        'border:1px solid rgba(255,255,255,0.12)',
+        'font-family:system-ui,-apple-system,sans-serif',
+      ].join(';');
+      document.body.appendChild(t);
+      window.setTimeout(() => {
+        try {
+          t.remove();
+        } catch (e2) {}
+      }, 10000);
+    } catch (e) {}
+  }
+
   function createLauncherOnPage() {
     document.getElementById('safe-hud-launcher-host')?.remove();
     const host = document.createElement('div');
     host.id = 'safe-hud-launcher-host';
     host.style.cssText =
-      'position:fixed;left:12px;bottom:12px;z-index:999999;font-family:Arial,sans-serif;display:flex;gap:8px;flex-wrap:wrap;';
+      'position:fixed;left:12px;bottom:12px;z-index:2147483646;font-family:Arial,sans-serif;display:flex;gap:8px;flex-wrap:wrap;align-items:center;';
     host.innerHTML = `
       <button type="button" id="safe-hud-open-win" style="background:#1a5f8a;color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.35);">HUD penceresini aç</button>
       <button type="button" id="safe-hud-close-all" style="background:#333;color:#fff;border:0;border-radius:10px;padding:10px 12px;cursor:pointer;">Kapat</button>
@@ -1163,6 +1448,7 @@
     document.body.appendChild(host);
     bindUserGestureOpen(document.getElementById('safe-hud-open-win'));
     document.getElementById('safe-hud-close-all').onclick = () => window.safeHudCleanup();
+    createMainSettingsPanel();
   }
 
   /**
@@ -1296,6 +1582,8 @@
     state.pendingSounds.length = 0;
     state.severePlaybackUntil = 0;
     state.priceHistory.length = 0;
+    state.happyLatchedThresholds.clear();
+    state.happySilencedUntilSevere = false;
   }
 
   /**
@@ -1317,6 +1605,15 @@
     }
     document.getElementById('safe-hud-launcher-host')?.remove();
     try {
+      document.getElementById('safe-hud-main-settings-wrap')?.remove();
+    } catch (eRm) {}
+    try {
+      document.getElementById('safe-hud-main-chrome-css')?.remove();
+    } catch (eRm2) {}
+    try {
+      document.getElementById(LAUNCHER_TOAST_ID)?.remove();
+    } catch (e0b) {}
+    try {
       if (state.hudWindow && !state.hudWindow.closed) {
         const w = state.hudWindow;
         if (w.__safeHudPopupOnMessage) w.removeEventListener('message', w.__safeHudPopupOnMessage);
@@ -1327,6 +1624,7 @@
     state.hudWindow = null;
     delete window.safeHudRearmFromSevereSlider;
     delete window.safeHudInvalidateDom;
+    delete window.safeHudGetSevereTestScaling;
   };
 
   createLauncherOnPage();
@@ -1334,6 +1632,6 @@
   state.timer = setInterval(tick, 500);
 
   console.log(
-    'Özet paneli: sol alttan pencereyi açın. Pencere açıkken güncelleme o pencerenin zamanlayıcısıyla çalışır (yan monitörde tutun).',
+    'HUD ayarları: sol alttaki açılır panel (ana pencere). Canlı özet: “HUD penceresini aç”. Ses testleri HUD açıkken çalar. Kaynak pencereyi minimize etmeyin.',
   );
 })();
