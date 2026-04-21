@@ -108,10 +108,6 @@
     priceHistory: [],
     /** @description Tampon eşiği (örn. 1505) için ses çalındı; fiyat eşiğin altına inene kadar tekrar yok */
     happyLatchedThresholds: new Set(),
-    /**
-     * @description Ağır alarm (severe) tetiklenene kadar yükseliş (happy) seslerini kapatır; yukarı trendde tekrar tekrar çalmasını önler.
-     */
-    happySilencedUntilSevere: false,
   };
 
   function save() {
@@ -345,36 +341,30 @@
 
   /**
    * @description Alarm sesi: popup kendi poll’unda iken kuyruğa alınır, aksi halde postMessage ile gönderilir.
-   * @param sound - severe | happy
-   * @param meta - severe için `computeSevereScalingFromDrop` çıktısı (intensityMul, durationMul)
+   * @param sound - severe (yükseliş bandı da aynı acil sekans; meta ile ayırt edilir)
+   * @param meta - `computeSevereScalingFromDrop` çıktısı; `skipRecoveryStopWindow` true iken fiyat artışında kesilmez
    */
   function emitPlaySound(sound, meta = {}) {
-    if (sound === 'severe') {
-      state.happySilencedUntilSevere = false;
-      const durationMul = meta.durationMul ?? 1;
+    if (sound !== 'severe') return;
+
+    const durationMul = meta.durationMul ?? 1;
+    const skipRecoveryStopWindow = !!meta.skipRecoveryStopWindow;
+    if (skipRecoveryStopWindow) {
+      state.severePlaybackUntil = 0;
+    } else {
       state.severePlaybackUntil = performance.now() + SEVERE_PLAYBACK_WINDOW_MS * durationMul;
-      const play = {
-        sound: 'severe',
-        intensityMul: meta.intensityMul ?? 1,
-        durationMul,
-      };
-      if (state.popupPollsOpener) {
-        state.pendingSounds.push(play);
-      } else {
-        postToPopup({ type: MSG.PLAY, ...play });
-      }
-      return;
     }
-    if (sound === 'happy') {
-      if (settings.severeEnabled) {
-        state.happySilencedUntilSevere = true;
-      }
-      const play = { sound: 'happy' };
-      if (state.popupPollsOpener) {
-        state.pendingSounds.push(play);
-      } else {
-        postToPopup({ type: MSG.PLAY, ...play });
-      }
+    const play = {
+      sound: 'severe',
+      intensityMul: meta.intensityMul ?? 1,
+      durationMul,
+      skipRecoveryStopWindow,
+      quickRepeatCooldown: !!meta.quickRepeatCooldown,
+    };
+    if (state.popupPollsOpener) {
+      state.pendingSounds.push(play);
+    } else {
+      postToPopup({ type: MSG.PLAY, ...play });
     }
   }
 
@@ -391,9 +381,28 @@
     } catch (e) {}
   }
 
+  /** @description `severeStep` için güvenli pozitif tam sayı adım. */
+  function getSevereStep() {
+    const s = Math.round(Number(settings.severeStep) || 50);
+    return Math.max(1, s);
+  }
+
+  /**
+   * @description Aşağı taranacak en üst eşik (adımın katı). Cüzdan `severeStart` üstündeyken de kademeler (ör. 2650) listeye girer.
+   * @param priceCandidates - Örn. anlık cüzdan veya prev+current
+   */
+  function getSevereGridTopAligned(...priceCandidates) {
+    const step = getSevereStep();
+    const nums = priceCandidates.filter((p) => p != null && Number.isFinite(p));
+    const rawTop = nums.length ? Math.max(settings.severeStart, ...nums) : settings.severeStart;
+    return Math.ceil(rawTop / step) * step;
+  }
+
   function updateArmedLevels(price) {
     if (price == null) return;
-    for (let level = settings.severeStart; level >= 0; level -= settings.severeStep) {
+    const step = getSevereStep();
+    const top = getSevereGridTopAligned(price);
+    for (let level = top; level >= 0; level -= step) {
       if (price >= level + settings.rearmOffset) {
         state.armedLevels.add(level);
       }
@@ -401,12 +410,15 @@
   }
 
   function checkSevereCrossings(prevPrice, currentPrice) {
+    if (!settings.severeEnabled) return;
     if (prevPrice == null || currentPrice == null) return;
     if (!(currentPrice < prevPrice)) return;
 
     /** Bir fiyat güncellemesinde yalnızca tek alarm; aksi halde birden fazla eşik aşılınca sesler üst üste biner. */
     let severePlayedThisTick = false;
-    for (let level = settings.severeStart; level >= 0; level -= settings.severeStep) {
+    const step = getSevereStep();
+    const top = getSevereGridTopAligned(prevPrice, currentPrice);
+    for (let level = top; level >= 0; level -= step) {
       const crossed = prevPrice > level && currentPrice <= level;
       if (state.armedLevels.has(level) && crossed) {
         if (!severePlayedThisTick) {
@@ -439,12 +451,9 @@
     }
 
     if (!settings.happyEnabled) return;
+    if (!settings.severeEnabled) return;
 
     if (!(currentPrice > prevPrice)) return;
-
-    if (settings.severeEnabled && state.happySilencedUntilSevere) {
-      return;
-    }
 
     const prev50 = Math.floor(prevPrice / 50) * 50;
     const curr50 = Math.floor(currentPrice / 50) * 50;
@@ -457,7 +466,12 @@
       if (happyCount >= maxHappyPerTick) return;
       if (state.happyLatchedThresholds.has(threshold)) return;
       if (prevPrice < threshold && currentPrice >= threshold) {
-        emitPlaySound('happy');
+        emitPlaySound('severe', {
+          intensityMul: 1,
+          durationMul: 1,
+          skipRecoveryStopWindow: true,
+          quickRepeatCooldown: true,
+        });
         state.happyLatchedThresholds.add(threshold);
         happyCount += 1;
       }
@@ -477,7 +491,6 @@
    */
   window.safeHudRearmFromSevereSlider = () => {
     state.armedLevels.clear();
-    state.happySilencedUntilSevere = false;
     const currentPrice = getWalletPrice();
     if (currentPrice != null) {
       updateArmedLevels(currentPrice);
@@ -1004,32 +1017,6 @@
       }
     }
 
-    function playHappy(s) {
-      if (!s.happyEnabled) return;
-      const ctx = getAudioCtx();
-      if (!ctx) return;
-      const start = ctx.currentTime;
-      const comp = compressor(ctx, -20, 8);
-      const gap = 0.34;
-      const atk = 0.04;
-      const sustainEnd = 0.72;
-      const stopAt = 0.82;
-      [523.25, 659.25, 783.99].forEach((freq, i) => {
-        const t = start + i * gap;
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(freq, t);
-        gain.gain.setValueAtTime(0.0001, t);
-        gain.gain.exponentialRampToValueAtTime(s.happyVolume, t + atk);
-        gain.gain.exponentialRampToValueAtTime(0.0001, t + sustainEnd);
-        osc.connect(gain);
-        gain.connect(comp);
-        osc.start(t);
-        osc.stop(t + stopAt);
-      });
-    }
-
     /**
      * @description Devam eden ağır alarm osilatörlerini durdurur (yeni tetiklemeden önce).
      */
@@ -1055,7 +1042,8 @@
       const durM = Math.min(2.2, Math.max(0.85, Number(opts.durationMul) || 1));
 
       const nowWall = performance.now();
-      const cooldownMs = Math.round(11500 * durM);
+      const baseCooldownMs = opts.quickRepeatCooldown ? 2200 : 11500;
+      const cooldownMs = Math.round(baseCooldownMs * durM);
       if (!opts.force && audioState.severeCooldownUntil > nowWall) {
         return;
       }
@@ -1067,7 +1055,7 @@
       const comp = compressor(ctx, -8 - intM * 1.5, compRatio);
       const oscCount = Math.min(110, Math.round(42 * durM + 8));
       const stepSec = 0.2 / Math.max(0.82, Math.sqrt(intM));
-      const volPeak = Math.min(1.28, s.severeVolume * intM);
+      const volPeak = Math.max(0.0001, Math.min(1.28, s.severeVolume * intM));
       const pulseAttack = 0.014;
       const pulseDecayEnd = 0.52;
       const pulseStop = 0.62;
@@ -1241,9 +1229,18 @@
               force: !!ev.data.force,
               intensityMul: ev.data.intensityMul,
               durationMul: ev.data.durationMul,
+              quickRepeatCooldown: !!ev.data.quickRepeatCooldown,
             });
           }
-          if (ev.data.sound === 'happy') playHappy(s);
+          if (ev.data.sound === 'happy') {
+            playSevere(s, {
+              force: !!ev.data.force,
+              intensityMul: 1,
+              durationMul: 1,
+              skipRecoveryStopWindow: true,
+              quickRepeatCooldown: true,
+            });
+          }
         });
       }
     };
@@ -1512,6 +1509,8 @@
               sound: item.sound,
               intensityMul: item.intensityMul,
               durationMul: item.durationMul,
+              skipRecoveryStopWindow: item.skipRecoveryStopWindow,
+              quickRepeatCooldown: item.quickRepeatCooldown,
             };
       postToPopup(play);
     });
@@ -1542,10 +1541,7 @@
         }
         const { payload, sounds } = runPollBody();
         popupWin.postMessage({ type: MSG.UPDATE, payload }, '*');
-        const playSounds = [];
-        const soundKey = (x) => (typeof x === 'string' ? x : x?.sound);
         for (const item of sounds) {
-          if (soundKey(item) === 'severe' && soundKey(playSounds[playSounds.length - 1]) === 'severe') continue;
           const msg =
             typeof item === 'string'
               ? { type: MSG.PLAY, sound: item }
@@ -1554,10 +1550,11 @@
                   sound: item.sound,
                   intensityMul: item.intensityMul,
                   durationMul: item.durationMul,
+                  skipRecoveryStopWindow: item.skipRecoveryStopWindow,
+                  quickRepeatCooldown: item.quickRepeatCooldown,
                 };
-          playSounds.push(msg);
+          popupWin.postMessage(msg, '*');
         }
-        playSounds.forEach((msg) => popupWin.postMessage(msg, '*'));
       } catch (e) {}
     };
     run();
@@ -1583,7 +1580,6 @@
     state.severePlaybackUntil = 0;
     state.priceHistory.length = 0;
     state.happyLatchedThresholds.clear();
-    state.happySilencedUntilSevere = false;
   }
 
   /**
