@@ -18,6 +18,11 @@
   /** Bu düşüşte tam “güçlü” ölçek kabul edilir (üstü daha da artar, tavan kodda) */
   const SEVERE_DROP_REF_USD = 200;
 
+  /** 100 USD katları (2500, 2400…) — kritik alarm (uzun / güçlü) */
+  const DROP_CRITICAL_GRID_USD = 100;
+  /** 50 USD katları (2650, 2750…) — basit alarm; 100’lükler kritiğe düşer */
+  const DROP_SIMPLE_GRID_USD = 50;
+
   /**
    * @description Nuxt risk header içindeki cüzdan tutarı (.value).
    * `.ready` yoksa yedek seçici denenir. `settings.walletSelector` doluysa önce o kullanılır.
@@ -341,14 +346,20 @@
 
   /**
    * @description Alarm sesi: popup kendi poll’unda iken kuyruğa alınır, aksi halde postMessage ile gönderilir.
-   * @param sound - severe (yükseliş bandı da aynı acil sekans; meta ile ayırt edilir)
-   * @param meta - `computeSevereScalingFromDrop` çıktısı; `skipRecoveryStopWindow` true iken fiyat artışında kesilmez
+   * @param sound - severe
+   * @param meta - Ölçekleme + `tier`: critical (100 USD) | simple (50 USD); `skipRecoveryStopWindow` isteğe bağlı
    */
   function emitPlaySound(sound, meta = {}) {
     if (sound !== 'severe') return;
 
     const durationMul = meta.durationMul ?? 1;
-    const skipRecoveryStopWindow = !!meta.skipRecoveryStopWindow;
+    const tier = meta.tier === 'critical' ? 'critical' : 'simple';
+    const quickRepeat = !!meta.quickRepeatCooldown;
+    let skipRecoveryStopWindow;
+    if (meta.skipRecoveryStopWindow === true) skipRecoveryStopWindow = true;
+    else if (meta.skipRecoveryStopWindow === false) skipRecoveryStopWindow = false;
+    else skipRecoveryStopWindow = quickRepeat || tier === 'simple';
+
     if (skipRecoveryStopWindow) {
       state.severePlaybackUntil = 0;
     } else {
@@ -359,7 +370,8 @@
       intensityMul: meta.intensityMul ?? 1,
       durationMul,
       skipRecoveryStopWindow,
-      quickRepeatCooldown: !!meta.quickRepeatCooldown,
+      quickRepeatCooldown: quickRepeat,
+      tier,
     };
     if (state.popupPollsOpener) {
       state.pendingSounds.push(play);
@@ -398,6 +410,18 @@
     return Math.ceil(rawTop / step) * step;
   }
 
+  /**
+   * @description Düşüş eşiği 100 USD katı mı (kritik), yoksa 50’lik basit mi.
+   * @param level - Eşik USD (örn. 2650, 2500)
+   */
+  function severeDropTierForLevel(level) {
+    const L = Math.round(Number(level));
+    if (!Number.isFinite(L)) return 'simple';
+    if (L % DROP_CRITICAL_GRID_USD === 0) return 'critical';
+    if (L % DROP_SIMPLE_GRID_USD === 0) return 'simple';
+    return 'simple';
+  }
+
   function updateArmedLevels(price) {
     if (price == null) return;
     const step = getSevereStep();
@@ -414,22 +438,28 @@
     if (prevPrice == null || currentPrice == null) return;
     if (!(currentPrice < prevPrice)) return;
 
-    /** Bir fiyat güncellemesinde yalnızca tek alarm; aksi halde birden fazla eşik aşılınca sesler üst üste biner. */
-    let severePlayedThisTick = false;
     const step = getSevereStep();
     const top = getSevereGridTopAligned(prevPrice, currentPrice);
+    const crossedLevels = [];
     for (let level = top; level >= 0; level -= step) {
       const crossed = prevPrice > level && currentPrice <= level;
       if (state.armedLevels.has(level) && crossed) {
-        if (!severePlayedThisTick) {
-          const dropUsd = getDropUsdInRollingWindow(currentPrice, PRICE_ROLLING_WINDOW_MS);
-          const scale = computeSevereScalingFromDrop(dropUsd);
-          emitPlaySound('severe', scale);
-          severePlayedThisTick = true;
-        }
-        state.armedLevels.delete(level);
+        crossedLevels.push(level);
       }
     }
+    if (crossedLevels.length === 0) return;
+
+    for (const level of crossedLevels) {
+      state.armedLevels.delete(level);
+    }
+
+    /** Aynı tick’te hem 50 hem 100 aşılmışsa yalnızca kritik (100) sesi çalar. */
+    const tier = crossedLevels.some((L) => severeDropTierForLevel(L) === 'critical')
+      ? 'critical'
+      : 'simple';
+    const dropUsd = getDropUsdInRollingWindow(currentPrice, PRICE_ROLLING_WINDOW_MS);
+    const scale = computeSevereScalingFromDrop(dropUsd);
+    emitPlaySound('severe', { ...scale, tier });
   }
 
   /**
@@ -471,6 +501,7 @@
           durationMul: 1,
           skipRecoveryStopWindow: true,
           quickRepeatCooldown: true,
+          tier: 'simple',
         });
         state.happyLatchedThresholds.add(threshold);
         happyCount += 1;
@@ -608,11 +639,13 @@
     <label style="display:block;font-size:11px;color:var(--sh-muted);margin-bottom:4px;">PnL kök CSS</label>
     <input id="safe-pnl-selector" class="sh-inp" type="text" value="${pSel}" placeholder=".unrealized-pnl-value" style="margin-bottom:14px;">
 
+    <p style="margin:0 0 8px;font-size:11px;color:var(--sh-muted);line-height:1.4;">Düşüş: 50 USD (2650, 2750…) basit ses; 100 USD (2500, 2400…) kritik ses.</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-happy">Ses testi (yükseliş)</button>
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe" title="Sabit 1× şiddet / süre">Uyarı (basit)</button>
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-scaled" title="Kaynak sekmede son 3 dk düşüşüne göre">Uyarı (ölçekli)</button>
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-demo-max" title="Yaklaşık maksimum süre ve şiddet">Uyarı (max örnek)</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe" title="50 USD kademesi — kısa / hafif">50 USD (basit)</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-critical" title="100 USD kademesi — uzun / güçlü">100 USD (kritik)</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-scaled" title="Kaynak sekmede son 3 dk düşüşüne göre, kritik">Kritik ölçekli</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-demo-max" title="Yaklaşık maksimum süre ve şiddet, kritik">Kritik max</button>
     </div>
 
     <div class="sh-grid">
@@ -928,7 +961,16 @@
       postSoundToHudWindow({ type: MSG.PLAY, sound: 'happy', force: true });
     };
     document.getElementById('safe-test-severe').onclick = () => {
-      postSoundToHudWindow({ type: MSG.PLAY, sound: 'severe', force: true });
+      postSoundToHudWindow({
+        type: MSG.PLAY,
+        sound: 'severe',
+        force: true,
+        tier: 'simple',
+        skipRecoveryStopWindow: true,
+      });
+    };
+    document.getElementById('safe-test-severe-critical').onclick = () => {
+      postSoundToHudWindow({ type: MSG.PLAY, sound: 'severe', force: true, tier: 'critical' });
     };
     document.getElementById('safe-test-severe-scaled').onclick = () => {
       let sc = { intensityMul: 1, durationMul: 1 };
@@ -1030,19 +1072,36 @@
     }
 
     /**
-     * @description Ağır alarm. `force: true` soğumayı ve çakışmayı yok sayar (test düğmesi).
+     * @description Düşüş alarmı: `tier` critical = 100 USD kademesi (uzun/güçlü), simple = 50 USD veya hızlı tekrar.
      * @param opts.force - Test için soğuma atlanır; yine de önceki ses durdurulur.
+     * @param opts.tier - critical | simple (yok + quickRepeat yok → critical)
      */
     function playSevere(s, opts = {}) {
       if (!s.severeEnabled) return;
       const ctx = getAudioCtx();
       if (!ctx) return;
 
-      const intM = Math.min(2.5, Math.max(0.5, Number(opts.intensityMul) || 1));
-      const durM = Math.min(2.2, Math.max(0.85, Number(opts.durationMul) || 1));
+      const tier =
+        opts.quickRepeatCooldown ? 'simple' : opts.tier === 'simple' ? 'simple' : 'critical';
+
+      const intBase = Math.min(2.5, Math.max(0.5, Number(opts.intensityMul) || 1));
+      const durBase = Math.min(2.2, Math.max(0.85, Number(opts.durationMul) || 1));
+      let intM = intBase;
+      let durM = durBase;
+      if (tier === 'simple') {
+        intM = Math.min(1.42, intBase * 0.66);
+        durM = Math.min(1.22, durBase * 0.7);
+      }
 
       const nowWall = performance.now();
-      const baseCooldownMs = opts.quickRepeatCooldown ? 2200 : 11500;
+      let baseCooldownMs;
+      if (opts.quickRepeatCooldown) {
+        baseCooldownMs = 2200;
+      } else if (tier === 'simple') {
+        baseCooldownMs = 4800;
+      } else {
+        baseCooldownMs = 11500;
+      }
       const cooldownMs = Math.round(baseCooldownMs * durM);
       if (!opts.force && audioState.severeCooldownUntil > nowWall) {
         return;
@@ -1051,14 +1110,23 @@
       stopSevereVoicesNow();
 
       const start = ctx.currentTime;
-      const compRatio = Math.min(22, 16 + intM * 2.2);
-      const comp = compressor(ctx, -8 - intM * 1.5, compRatio);
-      const oscCount = Math.min(110, Math.round(42 * durM + 8));
-      const stepSec = 0.2 / Math.max(0.82, Math.sqrt(intM));
+      const compRatio = Math.min(
+        22,
+        tier === 'critical' ? 16 + intM * 2.2 : 13.5 + intM * 1.35,
+      );
+      const comp = compressor(ctx, tier === 'critical' ? -8 - intM * 1.5 : -12 - intM * 1.1, compRatio);
+      const oscCount =
+        tier === 'critical'
+          ? Math.min(110, Math.round(42 * durM + 8))
+          : Math.min(44, Math.round(17 * durM + 4));
+      const stepSec =
+        tier === 'critical'
+          ? 0.2 / Math.max(0.82, Math.sqrt(intM))
+          : 0.125 / Math.max(0.88, Math.sqrt(intM));
       const volPeak = Math.max(0.0001, Math.min(1.28, s.severeVolume * intM));
-      const pulseAttack = 0.014;
-      const pulseDecayEnd = 0.52;
-      const pulseStop = 0.62;
+      const pulseAttack = tier === 'critical' ? 0.014 : 0.011;
+      const pulseDecayEnd = tier === 'critical' ? 0.52 : 0.24;
+      const pulseStop = tier === 'critical' ? 0.62 : 0.3;
 
       for (let i = 0; i < oscCount; i++) {
         const t = start + i * stepSec;
@@ -1230,6 +1298,7 @@
               intensityMul: ev.data.intensityMul,
               durationMul: ev.data.durationMul,
               quickRepeatCooldown: !!ev.data.quickRepeatCooldown,
+              tier: ev.data.tier,
             });
           }
           if (ev.data.sound === 'happy') {
@@ -1239,6 +1308,7 @@
               durationMul: 1,
               skipRecoveryStopWindow: true,
               quickRepeatCooldown: true,
+              tier: 'simple',
             });
           }
         });
@@ -1511,6 +1581,7 @@
               durationMul: item.durationMul,
               skipRecoveryStopWindow: item.skipRecoveryStopWindow,
               quickRepeatCooldown: item.quickRepeatCooldown,
+              tier: item.tier,
             };
       postToPopup(play);
     });
@@ -1552,6 +1623,7 @@
                   durationMul: item.durationMul,
                   skipRecoveryStopWindow: item.skipRecoveryStopWindow,
                   quickRepeatCooldown: item.quickRepeatCooldown,
+                  tier: item.tier,
                 };
           popupWin.postMessage(msg, '*');
         }
