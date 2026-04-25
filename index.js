@@ -13,7 +13,7 @@
   /** Ağır alarm sekansı bitene kadar (ms) — fiyat yukarı dönünce susturmak için; süre çarpanı ile uzar */
   const SEVERE_PLAYBACK_WINDOW_MS = 14000;
 
-  /** Kayar pencere: son 3 dakikadaki zirveden bugüne düşüş (USD) alarm şiddetini belirler */
+  /** Kayar pencere: son 1 dakikadaki zirveden bugüne düşüş (USD) alarm şiddetini belirler */
   const PRICE_ROLLING_WINDOW_MS = 1 * 60 * 1000;
   /** Bu düşüşte tam “güçlü” ölçek kabul edilir (üstü daha da artar, tavan kodda) */
   const SEVERE_DROP_REF_USD = 200;
@@ -30,10 +30,7 @@
   const WALLET_SELECTOR =
     '#__nuxt > div > div:nth-child(2) > div > div.content-wrapper.common-scroll-bar.x-scroll.ready > div > div > section:nth-child(3) > div > div.account-info-wrapper > section > div.module-content > div.risk-header > div:nth-child(4) > div.value';
 
-  const WALLET_SELECTOR_FALLBACK = WALLET_SELECTOR.replace(
-    'common-scroll-bar.x-scroll.ready',
-    'common-scroll-bar.x-scroll',
-  );
+  const WALLET_SELECTOR_FALLBACK = WALLET_SELECTOR.replace('common-scroll-bar.x-scroll.ready', 'common-scroll-bar.x-scroll');
 
   const SELECTORS = {
     coinNames: '.symbol-name-wrapper',
@@ -65,6 +62,12 @@
     severeStart: 3000,
     severeStep: 50,
     rearmOffset: 5,
+    /** @description Eşiğin altına bu kadar USD (örn. 3300 → 3290) inmeden düşüş alarmı tetiklenmez */
+    dropConfirmUsd: 10,
+    /** @description Ardışık düşen poll sayısı (1 = tek tick’te yeterli derinlik yeter) */
+    minConsecutiveDown: 1,
+    /** @description Yükseliş sesleri arası minimum süre (ms) */
+    happyCooldownMs: 12000,
 
     panelCollapsed: false,
     hudLeft: 16,
@@ -109,10 +112,16 @@
     popupWinRef: null,
     /** @description performance.now() — ağır alarm çalarken fiyat yukarı çıkınca susturulur */
     severePlaybackUntil: 0,
-    /** @description { t: epochMs, p: number } — son ~3 dk cüzdan örnekleri */
+    /** @description { t: epochMs, p: number } — son ~1 dk+ cüzdan örnekleri */
     priceHistory: [],
     /** @description Tampon eşiği (örn. 1505) için ses çalındı; fiyat eşiğin altına inene kadar tekrar yok */
     happyLatchedThresholds: new Set(),
+    /** @description Kırmızı eşik geçildi ama henüz onay derinliğine inilmedi (L seviyesi USD) */
+    severeAwaitDepth: new Set(),
+    /** @description Son tick’e göre ardışık “fiyat düştü” poll sayısı (düz / yukarı sıfırlar) */
+    consecutiveDownStreak: 0,
+    /** @description performance.now() — yükseliş sesi global soğuma */
+    lastHappyGlobalAt: 0,
   };
 
   function save() {
@@ -176,7 +185,10 @@
   function formatHudWalletDisplay(raw) {
     let t = String(raw ?? '').trim();
     if (!t || t === '-') return '-';
-    t = t.replace(/\bUSD\b/gi, '').replace(/\s+/g, ' ').trim();
+    t = t
+      .replace(/\bUSD\b/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
     const dot = t.lastIndexOf('.');
     if (dot !== -1) {
       t = t.slice(0, dot).trim();
@@ -325,7 +337,7 @@
   }
 
   /**
-   * @description 3 dk içindeki düşüşe göre ağır alarm şiddeti ve süresi çarpanları.
+   * @description Kayar penceredeki düşüşe göre ağır alarm şiddeti ve süresi çarpanları.
    * @param dropUsd - `SEVERE_DROP_REF_USD` ile ölçeklenir
    */
   function computeSevereScalingFromDrop(dropUsd) {
@@ -425,38 +437,86 @@
   function updateArmedLevels(price) {
     if (price == null) return;
     const step = getSevereStep();
+    const rearRaw = Number(settings.rearmOffset);
+    const rear = Number.isFinite(rearRaw) ? Math.max(0, Math.min(200, rearRaw)) : 5;
     const top = getSevereGridTopAligned(price);
     for (let level = top; level >= 0; level -= step) {
-      if (price >= level + settings.rearmOffset) {
+      if (price >= level + rear) {
         state.armedLevels.add(level);
       }
     }
   }
 
+  function getDropConfirmUsd() {
+    const v = Number(settings.dropConfirmUsd);
+    if (!Number.isFinite(v) || v < 0) return 10;
+    return Math.min(250, v);
+  }
+
+  function getMinConsecutiveDown() {
+    const v = parseInt(String(settings.minConsecutiveDown), 10);
+    if (!Number.isFinite(v)) return 1;
+    return Math.max(1, Math.min(8, v));
+  }
+
+  function bumpConsecutiveDownStreak(prevPrice, currentPrice) {
+    if (prevPrice == null || currentPrice == null) return;
+    if (currentPrice < prevPrice) state.consecutiveDownStreak += 1;
+    else if (currentPrice > prevPrice) state.consecutiveDownStreak = 0;
+  }
+
   function checkSevereCrossings(prevPrice, currentPrice) {
     if (!settings.severeEnabled) return;
     if (prevPrice == null || currentPrice == null) return;
-    if (!(currentPrice < prevPrice)) return;
 
+    const dropConfirm = getDropConfirmUsd();
+    const minDown = getMinConsecutiveDown();
     const step = getSevereStep();
     const top = getSevereGridTopAligned(prevPrice, currentPrice);
-    const crossedLevels = [];
-    for (let level = top; level >= 0; level -= step) {
-      const crossed = prevPrice > level && currentPrice <= level;
-      if (state.armedLevels.has(level) && crossed) {
-        crossedLevels.push(level);
+
+    for (const L of [...state.severeAwaitDepth]) {
+      if (currentPrice > L) state.severeAwaitDepth.delete(L);
+    }
+
+    const downTick = currentPrice < prevPrice;
+    const strongDownMove = downTick && Number.isFinite(prevPrice) && prevPrice - currentPrice >= dropConfirm;
+    const streakOk = state.consecutiveDownStreak >= minDown || (minDown > 1 && strongDownMove);
+    const confirmed = [];
+
+    if (downTick) {
+      for (let level = top; level >= 0; level -= step) {
+        if (!state.armedLevels.has(level)) continue;
+        const crossed = prevPrice > level && currentPrice <= level;
+        if (!crossed) continue;
+        const deep = currentPrice <= level - dropConfirm;
+        if (deep && streakOk) {
+          confirmed.push(level);
+          state.severeAwaitDepth.delete(level);
+        } else if (!deep) {
+          state.severeAwaitDepth.add(level);
+        }
+      }
+      for (const L of [...state.severeAwaitDepth]) {
+        if (!state.armedLevels.has(L)) {
+          state.severeAwaitDepth.delete(L);
+          continue;
+        }
+        if (confirmed.includes(L)) continue;
+        const deep = currentPrice <= L - dropConfirm;
+        if (deep && streakOk) confirmed.push(L);
       }
     }
-    if (crossedLevels.length === 0) return;
 
-    for (const level of crossedLevels) {
+    const uniq = [...new Set(confirmed)];
+    if (uniq.length === 0) return;
+
+    for (const level of uniq) {
       state.armedLevels.delete(level);
+      state.severeAwaitDepth.delete(level);
     }
 
     /** Aynı tick’te hem 50 hem 100 aşılmışsa yalnızca kritik (100) sesi çalar. */
-    const tier = crossedLevels.some((L) => severeDropTierForLevel(L) === 'critical')
-      ? 'critical'
-      : 'simple';
+    const tier = uniq.some((L) => severeDropTierForLevel(L) === 'critical') ? 'critical' : 'simple';
     const dropUsd = getDropUsdInRollingWindow(currentPrice, PRICE_ROLLING_WINDOW_MS);
     const scale = computeSevereScalingFromDrop(dropUsd);
     emitPlaySound('severe', { ...scale, tier });
@@ -471,8 +531,7 @@
     if (prevPrice == null || currentPrice == null) return;
 
     const bufRaw = Number(settings.happyUpBufferUsd);
-    const buf =
-      Number.isFinite(bufRaw) && bufRaw >= 0 ? Math.min(100, bufRaw) : 5;
+    const buf = Number.isFinite(bufRaw) && bufRaw >= 0 ? Math.min(100, bufRaw) : 5;
 
     for (const thr of [...state.happyLatchedThresholds]) {
       if (currentPrice < thr) {
@@ -496,13 +555,17 @@
       if (happyCount >= maxHappyPerTick) return;
       if (state.happyLatchedThresholds.has(threshold)) return;
       if (prevPrice < threshold && currentPrice >= threshold) {
-        emitPlaySound('severe', {
-          intensityMul: 1,
-          durationMul: 1,
-          skipRecoveryStopWindow: true,
-          quickRepeatCooldown: true,
-          tier: 'simple',
-        });
+        const ms = Number(settings.happyCooldownMs);
+        const cd = Number.isFinite(ms) && ms >= 0 ? Math.min(120000, ms) : 12000;
+        const now = performance.now();
+        if (state.lastHappyGlobalAt > 0 && now - state.lastHappyGlobalAt < cd) return;
+        state.lastHappyGlobalAt = now;
+        const play = { type: MSG.PLAY, sound: 'happy', force: false };
+        if (state.popupPollsOpener) {
+          state.pendingSounds.push(play);
+        } else {
+          postToPopup(play);
+        }
         state.happyLatchedThresholds.add(threshold);
         happyCount += 1;
       }
@@ -522,6 +585,7 @@
    */
   window.safeHudRearmFromSevereSlider = () => {
     state.armedLevels.clear();
+    state.severeAwaitDepth.clear();
     const currentPrice = getWalletPrice();
     if (currentPrice != null) {
       updateArmedLevels(currentPrice);
@@ -535,7 +599,7 @@
   window.safeHudGetWalletPrice = () => getWalletPrice();
 
   /**
-   * @description Popup’tan “ölçekli uyarı” testi: opener’daki son 3 dk fiyat geçmişi + anlık cüzdan ile aynı çarpanlar.
+   * @description Popup’tan “ölçekli uyarı” testi: opener’daki son 1 dk fiyat geçmişi + anlık cüzdan ile aynı çarpanlar.
    * @returns intensityMul, durationMul, dropUsd
    */
   window.safeHudGetSevereTestScaling = () => {
@@ -558,35 +622,79 @@
    */
   function getSafeHudChromeCss() {
     return `
-      #sh-app { min-height:100vh; background:var(--sh-bg,#0f1419); color:var(--sh-text,#e8eaed); }
-      #sh-app.sh-privacy { --sh-up:#aab4c5; --sh-down:#aab4c5; }
-      :root { --sh-bg:#0f1419; --sh-card:#151c26; --sh-card2:#1c2636; --sh-line:#2a3548; --sh-text:#e8eaed; --sh-muted:#8b98ab; --sh-accent:#2f6fbe; --sh-up:#3ecf8e; --sh-down:#f07178; }
-      .sh-top { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:14px 18px;
-        background:linear-gradient(168deg,#1e2a3d 0%,#121820 55%); border-bottom:1px solid var(--sh-line); box-shadow:inset 0 1px 0 rgba(255,255,255,0.04); }
-      .sh-top-left { display:flex; align-items:center; gap:12px; min-width:0; }
-      .sh-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; background:linear-gradient(135deg,#5ad48f,var(--sh-accent)); box-shadow:0 0 14px rgba(47,111,190,0.35); }
-      .sh-top-title { font-size:15px; font-weight:650; letter-spacing:-0.02em; }
-      .sh-top-hint { font-size:11px; color:var(--sh-muted); max-width:min(380px,92vw); line-height:1.35; }
-      .sh-btn { border:0; border-radius:10px; padding:9px 14px; font-size:13px; font-weight:600; cursor:pointer; transition:opacity .15s, transform .1s; }
+      #sh-app { min-height:100vh; background:var(--sh-bg); color:var(--sh-text); color-scheme:dark;
+        font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif; -webkit-font-smoothing:antialiased; }
+      #sh-app.sh-privacy { --sh-up:#9aa3b2; --sh-down:#9aa3b2; }
+      :root {
+        --sh-bg:#0b0f14;
+        --sh-card:#121922;
+        --sh-card2:#161d28;
+        --sh-line:#243044;
+        --sh-text:#e6e9ef;
+        --sh-muted:#8b95a8;
+        --sh-accent:#3d7dd6;
+        --sh-up:#45d483;
+        --sh-down:#f08080;
+        --sh-row-hover:rgba(255,255,255,0.03);
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .sh-btn { transition:none; }
+      }
+      .sh-top { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; padding:12px 16px;
+        background:linear-gradient(165deg,#151d2a 0%,#0d121a 100%); border-bottom:1px solid var(--sh-line);
+        box-shadow:inset 0 1px 0 rgba(255,255,255,0.035); }
+      .sh-top-left { display:flex; align-items:center; gap:10px; min-width:0; }
+      .sh-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; background:linear-gradient(135deg,#5ad48f,var(--sh-accent));
+        box-shadow:0 0 12px rgba(61,125,214,0.28); }
+      .sh-top-title { font-size:14px; font-weight:650; letter-spacing:-0.02em; }
+      .sh-top-hint { font-size:11px; color:var(--sh-muted); max-width:min(380px,92vw); line-height:1.4; }
+      .sh-btn { border:0; border-radius:10px; padding:9px 14px; font-size:13px; font-weight:600; cursor:pointer;
+        transition:opacity .15s, transform .12s; }
+      .sh-btn:focus-visible { outline:2px solid var(--sh-accent); outline-offset:2px; }
       .sh-btn:active { transform:scale(0.98); }
-      .sh-btn-primary { background:linear-gradient(180deg,#3a7bd5,#2a5fad); color:#fff; box-shadow:0 4px 14px rgba(42,95,173,0.35); }
-      .sh-btn-quiet { background:#2a3548; color:var(--sh-text); }
-      .sh-card { margin:14px 16px; background:var(--sh-card); border:1px solid var(--sh-line); border-radius:14px; overflow:hidden; box-shadow:0 12px 40px rgba(0,0,0,0.25); }
-      .sh-card-h { padding:12px 16px; background:rgba(255,255,255,0.03); border-bottom:1px solid var(--sh-line); display:flex; justify-content:space-between; align-items:center; gap:8px; }
+      .sh-btn-primary { background:linear-gradient(180deg,#4588e0,#2f6ab8); color:#fff; box-shadow:0 4px 16px rgba(47,106,184,0.32); }
+      .sh-btn-quiet { background:#222c3b; color:var(--sh-text); border:1px solid var(--sh-line); }
+      .sh-card { margin:14px 16px; background:var(--sh-card); border:1px solid var(--sh-line); border-radius:14px; overflow:hidden;
+        box-shadow:0 12px 40px rgba(0,0,0,0.28); }
+      .sh-card-h { padding:12px 16px; background:rgba(255,255,255,0.025); border-bottom:1px solid var(--sh-line);
+        display:flex; justify-content:space-between; align-items:center; gap:8px; }
       .sh-card-h strong { font-size:14px; letter-spacing:-0.01em; }
       .sh-card-body { padding:14px 16px 16px; }
       .sh-grid { display:grid; grid-template-columns:1fr auto; gap:10px 12px; align-items:center; font-size:13px; }
       .sh-grid label { color:var(--sh-muted); }
-      .sh-inp, .sh-select { width:100%; max-width:100%; padding:8px 10px; border-radius:8px; border:1px solid var(--sh-line); background:#0d1219; color:var(--sh-text); box-sizing:border-box; font-size:13px; }
-      .sh-hud { margin:0 16px 20px; padding:16px 18px; background:linear-gradient(180deg,#121a24,#0e141c); border:1px solid var(--sh-line); border-radius:16px; box-sizing:border-box; overflow:hidden;
-        box-shadow:0 8px 32px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.03); }
-      .sh-hud-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--sh-muted); margin-bottom:8px; }
-      .sh-hud-wallet { font-weight:800; line-height:1.08; margin-bottom:12px; letter-spacing:-0.02em; }
+      .sh-inp, .sh-select { width:100%; max-width:100%; padding:8px 10px; border-radius:8px; border:1px solid var(--sh-line);
+        background:#0a1018; color:var(--sh-text); box-sizing:border-box; font-size:13px; }
+      .sh-hud { margin:0 auto 20px; padding:0; background:transparent; border:0; border-radius:0; box-sizing:border-box;
+        overflow:visible; box-shadow:none; max-width:100%; }
+      .sh-hud-inner { padding:18px 18px 16px; background:linear-gradient(180deg,#131b26 0%,#0e141c 100%);
+        border:1px solid var(--sh-line); border-radius:18px; box-shadow:0 10px 40px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.04); }
+      .sh-hud-label { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--sh-muted);
+        margin:0 0 10px; }
+      .sh-hud-wallet-wrap { margin-bottom:14px; padding:12px 14px; border-radius:14px; background:rgba(0,0,0,0.22);
+        border:1px solid rgba(255,255,255,0.06); }
+      .sh-hud-wallet { font-weight:800; line-height:1.06; letter-spacing:-0.03em; font-variant-numeric:tabular-nums; }
       #safe-hud-positions { width:100%; max-width:100%; min-width:0; box-sizing:border-box; }
-      .sh-row { display:flex; justify-content:space-between; align-items:flex-end; gap:10px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.06);
-        width:100%; max-width:100%; min-width:0; box-sizing:border-box; overflow:hidden; }
-      .sh-row:last-child { border-bottom:0; }
-      .sh-status { margin-top:12px; font-size:11px; color:var(--sh-muted); }
+      .sh-row { display:flex; justify-content:space-between; align-items:flex-end; gap:10px; padding:9px 10px; margin:0 -6px;
+        border-radius:10px; width:calc(100% + 12px); max-width:calc(100% + 12px); min-width:0; box-sizing:border-box; overflow:hidden; }
+      .sh-row + .sh-row { margin-top:2px; }
+      @media (prefers-reduced-motion: no-preference) {
+        .sh-row { transition:background .12s ease; }
+      }
+      .sh-row:hover { background:var(--sh-row-hover); }
+      .sh-row-coin { font-weight:800; line-height:1; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .sh-row-right { display:flex; flex-direction:column; align-items:flex-end; gap:3px; flex:0 1 auto; min-width:0; max-width:58%; }
+      .sh-row-pnl { font-weight:700; line-height:1; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+        font-variant-numeric:tabular-nums; }
+      .sh-row-pct { font-weight:600; opacity:0.9; line-height:1; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+        font-variant-numeric:tabular-nums; }
+      .sh-tone-up { color:var(--sh-up); }
+      .sh-tone-down { color:var(--sh-down); }
+      .sh-tone-neu { color:rgba(255,255,255,0.9); }
+      .sh-tone-office { color:#aeb4c8; }
+      .sh-tone-office-pos { color:#8daf9e; }
+      .sh-tone-office-neg { color:#b89a9a; }
+      .sh-status { margin-top:14px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.06); font-size:10px; color:var(--sh-muted);
+        letter-spacing:0.02em; }
     `;
   }
 
@@ -639,12 +747,12 @@
     <label style="display:block;font-size:11px;color:var(--sh-muted);margin-bottom:4px;">PnL kök CSS</label>
     <input id="safe-pnl-selector" class="sh-inp" type="text" value="${pSel}" placeholder=".unrealized-pnl-value" style="margin-bottom:14px;">
 
-    <p style="margin:0 0 8px;font-size:11px;color:var(--sh-muted);line-height:1.4;">Düşüş: 50 USD (2650, 2750…) basit ses; 100 USD (2500, 2400…) kritik ses.</p>
+    <p style="margin:0 0 8px;font-size:11px;color:var(--sh-muted);line-height:1.4;">Düşüş: 50 USD kademeleri basit, 100 USD kritik ses. Alarm yalnızca eşiğin altına <strong>onay derinliği</strong> (USD) kadar inip, ardışık düşen tick sayısı sağlandığında çalar — sınırda salınımı keser.</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-happy">Ses testi (yükseliş)</button>
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe" title="50 USD kademesi — kısa / hafif">50 USD (basit)</button>
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-critical" title="100 USD kademesi — uzun / güçlü">100 USD (kritik)</button>
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-scaled" title="Kaynak sekmede son 3 dk düşüşüne göre, kritik">Kritik ölçekli</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-scaled" title="Kaynak sekmede son 1 dk düşüşüne göre, kritik">Kritik ölçekli</button>
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-demo-max" title="Yaklaşık maksimum süre ve şiddet, kritik">Kritik max</button>
     </div>
 
@@ -666,6 +774,38 @@
       <div style="display:flex;align-items:center;gap:8px;">
         <input id="safe-happy-buffer" type="range" min="0" max="25" step="1" value="${Number.isFinite(s.happyUpBufferUsd) ? s.happyUpBufferUsd : 5}">
         <span id="safe-happy-buffer-val">${Number.isFinite(s.happyUpBufferUsd) ? s.happyUpBufferUsd : 5}</span>
+      </div>
+      <label>Düşüş onay derinliği (USD)</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-drop-confirm" type="range" min="0" max="80" step="1" value="${Number.isFinite(s.dropConfirmUsd) ? s.dropConfirmUsd : 10}">
+        <span id="safe-drop-confirm-val">${Number.isFinite(s.dropConfirmUsd) ? s.dropConfirmUsd : 10}</span>
+      </div>
+      <label>Ardışık düşüş tick</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-min-consecutive-down" type="range" min="1" max="5" step="1" value="${Number.isFinite(s.minConsecutiveDown) ? s.minConsecutiveDown : 1}">
+        <span id="safe-min-consecutive-down-val">${Number.isFinite(s.minConsecutiveDown) ? s.minConsecutiveDown : 1}</span>
+      </div>
+      <label>Yükseliş sesi soğuma (sn)</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-happy-cooldown" type="range" min="0" max="60" step="1" value="${Math.round((Number.isFinite(s.happyCooldownMs) ? s.happyCooldownMs : 12000) / 1000)}">
+        <span id="safe-happy-cooldown-val">${Math.round((Number.isFinite(s.happyCooldownMs) ? s.happyCooldownMs : 12000) / 1000)}</span>
+      </div>
+      <label>Izgara adımı (USD)</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-severe-step" type="range" min="25" max="100" step="25" value="${(() => {
+          const r = Math.round(Number(s.severeStep) || 50);
+          const q = Math.min(100, Math.max(25, Math.round(r / 25) * 25));
+          return q;
+        })()}">
+        <span id="safe-severe-step-val">${(() => {
+          const r = Math.round(Number(s.severeStep) || 50);
+          return Math.min(100, Math.max(25, Math.round(r / 25) * 25));
+        })()}</span>
+      </div>
+      <label>Yeniden silah (USD üstü)</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-rearm-offset" type="range" min="0" max="40" step="1" value="${Number.isFinite(s.rearmOffset) ? s.rearmOffset : 5}">
+        <span id="safe-rearm-offset-val">${Number.isFinite(s.rearmOffset) ? s.rearmOffset : 5}</span>
       </div>
       <label>Ağır ses</label>
       <div style="display:flex;align-items:center;gap:8px;">
@@ -727,15 +867,15 @@
   function buildHudPopupHtml(s) {
     return `
 <div id="sh-app" class="${s.privacyOfficeMode ? 'sh-privacy' : ''}">
-  <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 14px;background:var(--sh-card);border-bottom:1px solid var(--sh-line);">
-    <span style="font-size:12px;color:var(--sh-muted);">Ses için tıklayın</span>
-    <button type="button" class="sh-btn sh-btn-primary" id="safe-popup-focus-opener" style="padding:6px 12px;font-size:12px;">Kaynak sekmesi</button>
-  </div>
-  <div id="safe-hud-display" class="sh-hud" style="width:${s.hudWidth}px;margin:12px auto 16px;">
-    <div class="sh-hud-label" id="safe-hud-main-label">Canlı özet</div>
-    <div id="safe-hud-wallet" class="sh-hud-wallet">-</div>
-    <div id="safe-hud-positions" style="display:flex;flex-direction:column;gap:${s.hudGap}px;width:100%;max-width:100%;min-width:0;box-sizing:border-box;"></div>
-    <div id="safe-hud-status" class="sh-status"></div>
+  <div id="safe-hud-display" class="sh-hud" style="width:${s.hudWidth}px;margin:14px 16px 20px;">
+    <div class="sh-hud-inner">
+      <div class="sh-hud-label" id="safe-hud-main-label">Canlı özet</div>
+      <div class="sh-hud-wallet-wrap">
+        <div id="safe-hud-wallet" class="sh-hud-wallet">-</div>
+      </div>
+      <div id="safe-hud-positions" style="display:flex;flex-direction:column;gap:${s.hudGap}px;width:100%;max-width:100%;min-width:0;box-sizing:border-box;"></div>
+      <div id="safe-hud-status" class="sh-status"></div>
+    </div>
   </div>
 </div>`;
   }
@@ -917,6 +1057,49 @@
       notifyHudSettingsChanged();
     };
 
+    document.getElementById('safe-drop-confirm').oninput = (e) => {
+      const st = readMainPanelSettings();
+      st.dropConfirmUsd = parseInt(e.target.value, 10);
+      document.getElementById('safe-drop-confirm-val').textContent = String(st.dropConfirmUsd);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      notifyHudSettingsChanged();
+    };
+    document.getElementById('safe-min-consecutive-down').oninput = (e) => {
+      const st = readMainPanelSettings();
+      st.minConsecutiveDown = parseInt(e.target.value, 10);
+      document.getElementById('safe-min-consecutive-down-val').textContent = String(st.minConsecutiveDown);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      notifyHudSettingsChanged();
+    };
+    document.getElementById('safe-happy-cooldown').oninput = (e) => {
+      const st = readMainPanelSettings();
+      const sec = parseInt(e.target.value, 10);
+      st.happyCooldownMs = Math.max(0, sec) * 1000;
+      document.getElementById('safe-happy-cooldown-val').textContent = String(Math.max(0, sec));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      notifyHudSettingsChanged();
+    };
+    document.getElementById('safe-severe-step').oninput = (e) => {
+      const st = readMainPanelSettings();
+      st.severeStep = parseInt(e.target.value, 10);
+      document.getElementById('safe-severe-step-val').textContent = String(st.severeStep);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      try {
+        if (window.safeHudRearmFromSevereSlider) window.safeHudRearmFromSevereSlider();
+      } catch (err) {}
+      notifyHudSettingsChanged();
+    };
+    document.getElementById('safe-rearm-offset').oninput = (e) => {
+      const st = readMainPanelSettings();
+      st.rearmOffset = parseInt(e.target.value, 10);
+      document.getElementById('safe-rearm-offset-val').textContent = String(st.rearmOffset);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      try {
+        if (window.safeHudRearmFromSevereSlider) window.safeHudRearmFromSevereSlider();
+      } catch (err2) {}
+      notifyHudSettingsChanged();
+    };
+
     document.getElementById('safe-severe-start').oninput = (e) => {
       const st = readMainPanelSettings();
       st.severeStart = parseInt(e.target.value, 10);
@@ -1081,8 +1264,11 @@
       const ctx = getAudioCtx();
       if (!ctx) return;
 
-      const tier =
-        opts.quickRepeatCooldown ? 'simple' : opts.tier === 'simple' ? 'simple' : 'critical';
+      const tier = opts.quickRepeatCooldown ? 'simple' : opts.tier === 'simple' ? 'simple' : 'critical';
+
+      const baseVol = opts.useHappyVolume
+        ? Math.max(0.0001, Math.min(1, Number(s.happyVolume) || 0.06))
+        : Math.max(0.0001, Math.min(1, Number(s.severeVolume) || 0.06));
 
       const intBase = Math.min(2.5, Math.max(0.5, Number(opts.intensityMul) || 1));
       const durBase = Math.min(2.2, Math.max(0.85, Number(opts.durationMul) || 1));
@@ -1110,20 +1296,11 @@
       stopSevereVoicesNow();
 
       const start = ctx.currentTime;
-      const compRatio = Math.min(
-        22,
-        tier === 'critical' ? 16 + intM * 2.2 : 13.5 + intM * 1.35,
-      );
+      const compRatio = Math.min(22, tier === 'critical' ? 16 + intM * 2.2 : 13.5 + intM * 1.35);
       const comp = compressor(ctx, tier === 'critical' ? -8 - intM * 1.5 : -12 - intM * 1.1, compRatio);
-      const oscCount =
-        tier === 'critical'
-          ? Math.min(110, Math.round(42 * durM + 8))
-          : Math.min(44, Math.round(17 * durM + 4));
-      const stepSec =
-        tier === 'critical'
-          ? 0.2 / Math.max(0.82, Math.sqrt(intM))
-          : 0.125 / Math.max(0.88, Math.sqrt(intM));
-      const volPeak = Math.max(0.0001, Math.min(1.28, s.severeVolume * intM));
+      const oscCount = tier === 'critical' ? Math.min(110, Math.round(42 * durM + 8)) : Math.min(44, Math.round(17 * durM + 4));
+      const stepSec = tier === 'critical' ? 0.2 / Math.max(0.82, Math.sqrt(intM)) : 0.125 / Math.max(0.88, Math.sqrt(intM));
+      const volPeak = Math.max(0.0001, Math.min(1.28, baseVol * intM));
       const pulseAttack = tier === 'critical' ? 0.014 : 0.011;
       const pulseDecayEnd = tier === 'critical' ? 0.52 : 0.24;
       const pulseStop = tier === 'critical' ? 0.62 : 0.3;
@@ -1204,17 +1381,12 @@
       const statusEl = d.getElementById('safe-hud-status');
       const hudBox = d.getElementById('safe-hud-display');
 
-      const green = '#4ade80';
-      const red = '#f87171';
-      const neutral = 'rgba(255,255,255,0.92)';
-      const officeMuted = '#aeb4c8';
-
       if (hudBox) hudBox.style.width = `${s.hudWidth}px`;
 
       if (walletEl) {
         walletEl.textContent = formatHudWalletDisplay(payload.wallet);
         walletEl.style.fontSize = `${s.hudWalletFontSize}px`;
-        walletEl.style.color = privacy ? officeMuted : neutral;
+        walletEl.className = `sh-hud-wallet ${privacy ? 'sh-tone-office' : 'sh-tone-neu'}`;
       }
       if (positionsEl) {
         positionsEl.style.gap = `${s.hudGap}px`;
@@ -1232,35 +1404,39 @@
           const left = d.createElement('div');
           left.textContent = mask ? `Kalem ${idx + 1}` : pos.coin || '-';
           const pnlNum = parseHudRowPnl(pos.pnl);
-          let rowTone = neutral;
-          if (!privacy) {
-            if (pnlNum != null) {
-              if (pnlNum > 0) rowTone = green;
-              else if (pnlNum < 0) rowTone = red;
-            }
-          } else {
-            rowTone = officeMuted;
+          let coinCls = 'sh-tone-neu';
+          if (privacy) coinCls = 'sh-tone-office';
+          else if (pnlNum != null) {
+            if (pnlNum > 0) coinCls = 'sh-tone-up';
+            else if (pnlNum < 0) coinCls = 'sh-tone-down';
           }
-          left.style.cssText = `font-weight:800;font-size:${s.hudCoinFontSize}px;line-height:1;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${rowTone};`;
+          left.className = `sh-row-coin ${coinCls}`;
+          left.style.fontSize = `${s.hudCoinFontSize}px`;
           const rightWrap = d.createElement('div');
-          rightWrap.style.cssText =
-            'display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex:0 1 auto;min-width:0;max-width:58%;';
+          rightWrap.className = 'sh-row-right';
           const pnl = d.createElement('div');
           const pnlShown = formatHudStripSignChars(pos.pnl);
           pnl.textContent = pnlShown;
-          let pnlColor = rowTone;
-          if (privacy && pnlNum != null) {
-            if (pnlNum > 0) pnlColor = '#8daf9e';
-            else if (pnlNum < 0) pnlColor = '#b89a9a';
-            else pnlColor = officeMuted;
+          let pnlCls = 'sh-tone-neu';
+          if (privacy) {
+            if (pnlNum != null) {
+              if (pnlNum > 0) pnlCls = 'sh-tone-office-pos';
+              else if (pnlNum < 0) pnlCls = 'sh-tone-office-neg';
+              else pnlCls = 'sh-tone-office';
+            } else pnlCls = 'sh-tone-office';
+          } else if (pnlNum != null) {
+            if (pnlNum > 0) pnlCls = 'sh-tone-up';
+            else if (pnlNum < 0) pnlCls = 'sh-tone-down';
           }
-          pnl.style.cssText = `font-weight:700;font-size:${s.hudPnlFontSize}px;line-height:1;color:${pnlColor};max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`;
+          pnl.className = `sh-row-pnl ${pnlCls}`;
+          pnl.style.fontSize = `${s.hudPnlFontSize}px`;
           const pctShown = formatHudStripSignChars(pos.pct);
           rightWrap.appendChild(pnl);
           if (pctShown) {
             const pct = d.createElement('div');
             pct.textContent = pctShown;
-            pct.style.cssText = `font-weight:600;opacity:0.92;font-size:${s.hudPctFontSize}px;line-height:1;color:${pnlColor};max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`;
+            pct.className = `sh-row-pct ${pnlCls}`;
+            pct.style.fontSize = `${s.hudPctFontSize}px`;
             rightWrap.appendChild(pct);
           }
           row.appendChild(left);
@@ -1309,6 +1485,7 @@
               skipRecoveryStopWindow: true,
               quickRepeatCooldown: true,
               tier: 'simple',
+              useHappyVolume: true,
             });
           }
         });
@@ -1349,11 +1526,7 @@
       return true;
     }
 
-    const w = window.open(
-      '',
-      POPUP_WINDOW_NAME,
-      'width=300,height=720,scrollbars=yes,resizable=yes',
-    );
+    const w = window.open('', POPUP_WINDOW_NAME, 'width=300,height=720,scrollbars=yes,resizable=yes');
     if (!w) {
       showPopupBlockedHelp();
       return false;
@@ -1362,7 +1535,9 @@
     state.hudWindow = w;
     const d = w.document;
     d.open();
-    d.write(`<!DOCTYPE html><html lang="tr"><head><meta charset="utf-8"><title>Çalışma özeti</title></head><body style="margin:0;background:#0f1419;color:#e8eaed;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;"><div id="safe-popup-root"></div></body></html>`);
+    d.write(
+      `<!DOCTYPE html><html lang="tr"><head><meta charset="utf-8"><title>Çalışma özeti</title></head><body style="margin:0;background:#0f1419;color:#e8eaed;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;"><div id="safe-popup-root"></div></body></html>`,
+    );
     d.close();
 
     /**
@@ -1541,11 +1716,7 @@
     }
 
     const prevSample = state.lastWalletPrice;
-    if (
-      prevSample != null &&
-      currentPrice > prevSample &&
-      state.severePlaybackUntil > performance.now()
-    ) {
+    if (prevSample != null && currentPrice > prevSample && state.severePlaybackUntil > performance.now()) {
       state.severePlaybackUntil = 0;
       notifyStopSevere();
     }
@@ -1555,6 +1726,7 @@
       updateArmedLevels(currentPrice);
     } else {
       updateArmedLevels(currentPrice);
+      bumpConsecutiveDownStreak(state.lastWalletPrice, currentPrice);
       checkSevereCrossings(state.lastWalletPrice, currentPrice);
       checkHappy50Up(state.lastWalletPrice, currentPrice);
       state.lastWalletPrice = currentPrice;
@@ -1574,15 +1746,17 @@
       const play =
         typeof item === 'string'
           ? { type: MSG.PLAY, sound: item }
-          : {
-              type: MSG.PLAY,
-              sound: item.sound,
-              intensityMul: item.intensityMul,
-              durationMul: item.durationMul,
-              skipRecoveryStopWindow: item.skipRecoveryStopWindow,
-              quickRepeatCooldown: item.quickRepeatCooldown,
-              tier: item.tier,
-            };
+          : item.sound === 'happy'
+            ? { type: MSG.PLAY, sound: 'happy', force: !!item.force }
+            : {
+                type: MSG.PLAY,
+                sound: 'severe',
+                intensityMul: item.intensityMul,
+                durationMul: item.durationMul,
+                skipRecoveryStopWindow: item.skipRecoveryStopWindow,
+                quickRepeatCooldown: item.quickRepeatCooldown,
+                tier: item.tier,
+              };
       postToPopup(play);
     });
   }
@@ -1616,15 +1790,17 @@
           const msg =
             typeof item === 'string'
               ? { type: MSG.PLAY, sound: item }
-              : {
-                  type: MSG.PLAY,
-                  sound: item.sound,
-                  intensityMul: item.intensityMul,
-                  durationMul: item.durationMul,
-                  skipRecoveryStopWindow: item.skipRecoveryStopWindow,
-                  quickRepeatCooldown: item.quickRepeatCooldown,
-                  tier: item.tier,
-                };
+              : item.sound === 'happy'
+                ? { type: MSG.PLAY, sound: 'happy', force: !!item.force }
+                : {
+                    type: MSG.PLAY,
+                    sound: 'severe',
+                    intensityMul: item.intensityMul,
+                    durationMul: item.durationMul,
+                    skipRecoveryStopWindow: item.skipRecoveryStopWindow,
+                    quickRepeatCooldown: item.quickRepeatCooldown,
+                    tier: item.tier,
+                  };
           popupWin.postMessage(msg, '*');
         }
       } catch (e) {}
@@ -1652,6 +1828,9 @@
     state.severePlaybackUntil = 0;
     state.priceHistory.length = 0;
     state.happyLatchedThresholds.clear();
+    state.severeAwaitDepth.clear();
+    state.consecutiveDownStreak = 0;
+    state.lastHappyGlobalAt = 0;
   }
 
   /**
