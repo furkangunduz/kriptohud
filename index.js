@@ -68,6 +68,8 @@
     minConsecutiveDown: 1,
     /** @description Yükseliş sesleri arası minimum süre (ms) */
     happyCooldownMs: 12000,
+    /** @description Bu USD ve altı ızgara kademelerinde ekstra uzun/keskin alarm (varsayılan 3000) */
+    subprimeAlarmBelowUsd: 3000,
 
     panelCollapsed: false,
     hudLeft: 16,
@@ -122,6 +124,8 @@
     consecutiveDownStreak: 0,
     /** @description performance.now() — yükseliş sesi global soğuma */
     lastHappyGlobalAt: 0,
+    /** @description 100 USD kritik alarm bitene kadar fiyat yukarı gelse bile STOP gönderilmez */
+    criticalVoiceUntil: 0,
   };
 
   function save() {
@@ -348,6 +352,63 @@
     return { intensityMul, durationMul };
   }
 
+  /**
+   * @description 100 USD kritik alarm osilatör süresi (playSevere ile aynı formül).
+   * @returns totalMs — sesin bitişine kadar ms; voice-lock için
+   */
+  function criticalSevereSynthTiming(intensityMul, durationMul) {
+    const intBase = Math.min(2.5, Math.max(0.5, Number(intensityMul) || 1));
+    const durBase = Math.min(2.2, Math.max(0.85, Number(durationMul) || 1));
+    const intM = Math.min(2.75, intBase * 1.18);
+    const durM = Math.min(2.5, durBase * 1.22);
+    const oscCount = Math.min(200, Math.round(68 * durM + 18));
+    const stepSec = 0.125 / Math.max(0.68, Math.sqrt(intM));
+    const pulseStop = 0.88;
+    const tailPadSec = 0.55;
+    const totalSec = (oscCount - 1) * stepSec + pulseStop + tailPadSec;
+    return {
+      intM,
+      durM,
+      oscCount,
+      stepSec,
+      pulseStop,
+      pulseAttack: 0.02,
+      pulseDecayEnd: 0.74,
+      totalMs: Math.min(130000, Math.ceil(totalSec * 1000)),
+    };
+  }
+
+  /**
+   * @description `subprimeAlarmBelowUsd` altı kademe — kritikten daha uzun ve keskin (uyanma).
+   */
+  function sub3000SevereSynthTiming(intensityMul, durationMul) {
+    const intBase = Math.min(2.5, Math.max(0.5, Number(intensityMul) || 1));
+    const durBase = Math.min(2.2, Math.max(0.85, Number(durationMul) || 1));
+    const intM = Math.min(2.88, intBase * 1.32);
+    const durM = Math.min(2.58, durBase * 1.38);
+    const oscCount = Math.min(280, Math.round(96 * durM + 32));
+    const stepSec = 0.088 / Math.max(0.58, Math.sqrt(intM));
+    const pulseStop = 0.98;
+    const tailPadSec = 0.65;
+    const totalSec = (oscCount - 1) * stepSec + pulseStop + tailPadSec;
+    return {
+      intM,
+      durM,
+      oscCount,
+      stepSec,
+      pulseStop,
+      pulseAttack: 0.024,
+      pulseDecayEnd: 0.86,
+      totalMs: Math.min(180000, Math.ceil(totalSec * 1000)),
+    };
+  }
+
+  function getSubprimeThresholdUsd() {
+    const v = Number(settings.subprimeAlarmBelowUsd);
+    if (!Number.isFinite(v)) return 3000;
+    return Math.min(20000, Math.max(100, Math.round(v)));
+  }
+
   function recordPriceSample(price) {
     if (price == null || !Number.isFinite(price)) return;
     const t = Date.now();
@@ -359,22 +420,32 @@
   /**
    * @description Alarm sesi: popup kendi poll’unda iken kuyruğa alınır, aksi halde postMessage ile gönderilir.
    * @param sound - severe
-   * @param meta - Ölçekleme + `tier`: critical (100 USD) | simple (50 USD); `skipRecoveryStopWindow` isteğe bağlı
+   * @param meta - Ölçekleme + `tier`: sub3000 | critical | simple; `skipRecoveryStopWindow` isteğe bağlı
    */
   function emitPlaySound(sound, meta = {}) {
     if (sound !== 'severe') return;
 
     const durationMul = meta.durationMul ?? 1;
-    const tier = meta.tier === 'critical' ? 'critical' : 'simple';
+    const tier =
+      meta.tier === 'sub3000' ? 'sub3000' : meta.tier === 'critical' ? 'critical' : 'simple';
     const quickRepeat = !!meta.quickRepeatCooldown;
     let skipRecoveryStopWindow;
     if (meta.skipRecoveryStopWindow === true) skipRecoveryStopWindow = true;
     else if (meta.skipRecoveryStopWindow === false) skipRecoveryStopWindow = false;
     else skipRecoveryStopWindow = quickRepeat || tier === 'simple';
 
-    if (skipRecoveryStopWindow) {
+    if (tier === 'critical' || tier === 'sub3000') {
+      const crit =
+        tier === 'sub3000'
+          ? sub3000SevereSynthTiming(meta.intensityMul ?? 1, durationMul)
+          : criticalSevereSynthTiming(meta.intensityMul ?? 1, durationMul);
+      state.criticalVoiceUntil = performance.now() + crit.totalMs + 400;
+      state.severePlaybackUntil = state.criticalVoiceUntil;
+    } else if (skipRecoveryStopWindow) {
+      state.criticalVoiceUntil = 0;
       state.severePlaybackUntil = 0;
     } else {
+      state.criticalVoiceUntil = 0;
       state.severePlaybackUntil = performance.now() + SEVERE_PLAYBACK_WINDOW_MS * durationMul;
     }
     const play = {
@@ -385,6 +456,15 @@
       quickRepeatCooldown: quickRepeat,
       tier,
     };
+    debugAlarmTrigger('PLAY', {
+      tier,
+      intensityMul: Number((play.intensityMul ?? 1).toFixed(3)),
+      durationMul: Number((play.durationMul ?? 1).toFixed(3)),
+      skipRecoveryStopWindow,
+      popupPollsOpener: !!state.popupPollsOpener,
+      criticalVoiceUntil: Math.round(state.criticalVoiceUntil || 0),
+      severePlaybackUntil: Math.round(state.severePlaybackUntil || 0),
+    });
     if (state.popupPollsOpener) {
       state.pendingSounds.push(play);
     } else {
@@ -412,7 +492,7 @@
   }
 
   /**
-   * @description Aşağı taranacak en üst eşik (adımın katı). Cüzdan `severeStart` üstündeyken de kademeler (ör. 2650) listeye girer.
+   * @description Tarama üst sınırı (adımın katı). Tarama `severeStart` ve fiyatın üstünden başlar; alarm yalnızca L ≤ severeStart 100’lüklerde.
    * @param priceCandidates - Örn. anlık cüzdan veya prev+current
    */
   function getSevereGridTopAligned(...priceCandidates) {
@@ -434,13 +514,32 @@
     return 'simple';
   }
 
+  function getSevereStartCapUsd() {
+    const v = Math.round(Number(settings.severeStart));
+    return Number.isFinite(v) ? Math.min(200000, Math.max(0, v)) : 3000;
+  }
+
+  /**
+   * @description 100 USD katı ve `severeStart` tavanı altında (üst kademe alarmı yok, örn. 3200/3100 atlanır).
+   */
+  function isSevereHundredAlarmLevel(level) {
+    const L = Math.round(Number(level));
+    if (!Number.isFinite(L) || L % DROP_CRITICAL_GRID_USD !== 0) return false;
+    return L <= getSevereStartCapUsd();
+  }
+
   function updateArmedLevels(price) {
     if (price == null) return;
+    const cap = getSevereStartCapUsd();
+    for (const lv of [...state.armedLevels]) {
+      if (lv > cap || Math.round(Number(lv)) % DROP_CRITICAL_GRID_USD !== 0) state.armedLevels.delete(lv);
+    }
     const step = getSevereStep();
     const rearRaw = Number(settings.rearmOffset);
     const rear = Number.isFinite(rearRaw) ? Math.max(0, Math.min(200, rearRaw)) : 5;
     const top = getSevereGridTopAligned(price);
     for (let level = top; level >= 0; level -= step) {
+      if (!isSevereHundredAlarmLevel(level)) continue;
       if (price >= level + rear) {
         state.armedLevels.add(level);
       }
@@ -465,6 +564,15 @@
     else if (currentPrice > prevPrice) state.consecutiveDownStreak = 0;
   }
 
+  /**
+   * @description Alarm tetik nedenini tek yerde standart loglar.
+   */
+  function debugAlarmTrigger(tag, detail) {
+    try {
+      console.log(`[SAFE_HUD][ALARM][${tag}]`, detail);
+    } catch (e) {}
+  }
+
   function checkSevereCrossings(prevPrice, currentPrice) {
     if (!settings.severeEnabled) return;
     if (prevPrice == null || currentPrice == null) return;
@@ -476,6 +584,7 @@
 
     for (const L of [...state.severeAwaitDepth]) {
       if (currentPrice > L) state.severeAwaitDepth.delete(L);
+      else if (!isSevereHundredAlarmLevel(L)) state.severeAwaitDepth.delete(L);
     }
 
     const downTick = currentPrice < prevPrice;
@@ -485,6 +594,7 @@
 
     if (downTick) {
       for (let level = top; level >= 0; level -= step) {
+        if (!isSevereHundredAlarmLevel(level)) continue;
         if (!state.armedLevels.has(level)) continue;
         const crossed = prevPrice > level && currentPrice <= level;
         if (!crossed) continue;
@@ -497,6 +607,10 @@
         }
       }
       for (const L of [...state.severeAwaitDepth]) {
+        if (!isSevereHundredAlarmLevel(L)) {
+          state.severeAwaitDepth.delete(L);
+          continue;
+        }
         if (!state.armedLevels.has(L)) {
           state.severeAwaitDepth.delete(L);
           continue;
@@ -515,10 +629,28 @@
       state.severeAwaitDepth.delete(level);
     }
 
-    /** Aynı tick’te hem 50 hem 100 aşılmışsa yalnızca kritik (100) sesi çalar. */
-    const tier = uniq.some((L) => severeDropTierForLevel(L) === 'critical') ? 'critical' : 'simple';
+    /** Alt limit altı → sub3000; aksi 100 USD kritik (50’lik düşüşte alarm yok). */
+    const subT = getSubprimeThresholdUsd();
+    const tier = uniq.some((L) => L <= subT) ? 'sub3000' : 'critical';
     const dropUsd = getDropUsdInRollingWindow(currentPrice, PRICE_ROLLING_WINDOW_MS);
     const scale = computeSevereScalingFromDrop(dropUsd);
+    debugAlarmTrigger('DROP', {
+      at: new Date().toISOString(),
+      prevPrice,
+      currentPrice,
+      delta: Number((currentPrice - prevPrice).toFixed(3)),
+      severeStartCap: getSevereStartCapUsd(),
+      subprimeAlarmBelowUsd: subT,
+      dropConfirmUsd: dropConfirm,
+      minConsecutiveDown: minDown,
+      consecutiveDownStreak: state.consecutiveDownStreak,
+      crossedConfirmedLevels: uniq,
+      tier,
+      dropUsdInWindow: Number(dropUsd.toFixed(3)),
+      intensityMul: Number(scale.intensityMul.toFixed(3)),
+      durationMul: Number(scale.durationMul.toFixed(3)),
+      note: `100 USD levels only if L <= severeStart (${getSevereStartCapUsd()}). Fired: [${uniq.join(',')}].`,
+    });
     emitPlaySound('severe', { ...scale, tier });
   }
 
@@ -747,11 +879,12 @@
     <label style="display:block;font-size:11px;color:var(--sh-muted);margin-bottom:4px;">PnL kök CSS</label>
     <input id="safe-pnl-selector" class="sh-inp" type="text" value="${pSel}" placeholder=".unrealized-pnl-value" style="margin-bottom:14px;">
 
-    <p style="margin:0 0 8px;font-size:11px;color:var(--sh-muted);line-height:1.4;">Düşüş: 50 USD kademeleri basit, 100 USD kritik ses. Alarm yalnızca eşiğin altına <strong>onay derinliği</strong> (USD) kadar inip, ardışık düşen tick sayısı sağlandığında çalar — sınırda salınımı keser.</p>
+    <p style="margin:0 0 8px;font-size:11px;color:var(--sh-muted);line-height:1.4;">Düşüş alarmı yalnızca <strong>100 USD</strong> kademelerinde; 50’lik geçişlerde çalmaz. Alt limit ve altındaki 100’lüklerde ekstra uzun/keskin alarm. Onay derinliği + ardışık düşüş tick ile tetiklenir.</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-happy">Ses testi (yükseliş)</button>
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe" title="50 USD kademesi — kısa / hafif">50 USD (basit)</button>
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-critical" title="100 USD kademesi — uzun / güçlü">100 USD (kritik)</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-sub3000" title="Alt limit altı kademe — en uzun / en keskin">Alt limit alarm</button>
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-scaled" title="Kaynak sekmede son 1 dk düşüşüne göre, kritik">Kritik ölçekli</button>
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-demo-max" title="Yaklaşık maksimum süre ve şiddet, kritik">Kritik max</button>
     </div>
@@ -858,6 +991,11 @@
         <input id="safe-severe-start" type="range" min="500" max="3000" step="50" value="${s.severeStart}">
         <span id="safe-severe-start-val">${s.severeStart}</span>
       </div>
+      <label>Alt limit keskin alarm (≤ kademe USD)</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-subprime-below" type="range" min="500" max="8000" step="50" value="${Number.isFinite(s.subprimeAlarmBelowUsd) ? s.subprimeAlarmBelowUsd : 3000}">
+        <span id="safe-subprime-below-val">${Number.isFinite(s.subprimeAlarmBelowUsd) ? s.subprimeAlarmBelowUsd : 3000}</span>
+      </div>
     </div>`;
   }
 
@@ -867,6 +1005,9 @@
   function buildHudPopupHtml(s) {
     return `
 <div id="sh-app" class="${s.privacyOfficeMode ? 'sh-privacy' : ''}">
+  <div style="padding:10px 16px 0;">
+    <button type="button" id="safe-popup-focus-opener" class="sh-btn sh-btn-quiet" style="padding:6px 10px;font-size:12px;">Ana sekme</button>
+  </div>
   <div id="safe-hud-display" class="sh-hud" style="width:${s.hudWidth}px;margin:14px 16px 20px;">
     <div class="sh-hud-inner">
       <div class="sh-hud-label" id="safe-hud-main-label">Canlı özet</div>
@@ -1110,6 +1251,16 @@
       } catch (err) {}
       notifyHudSettingsChanged();
     };
+    document.getElementById('safe-subprime-below').oninput = (e) => {
+      const st = readMainPanelSettings();
+      st.subprimeAlarmBelowUsd = parseInt(e.target.value, 10);
+      document.getElementById('safe-subprime-below-val').textContent = String(st.subprimeAlarmBelowUsd);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+      try {
+        if (window.safeHudRearmFromSevereSlider) window.safeHudRearmFromSevereSlider();
+      } catch (errSp) {}
+      notifyHudSettingsChanged();
+    };
 
     const bindRangeMain = (id, key, suffix = 'px') => {
       const el = document.getElementById(id);
@@ -1154,6 +1305,16 @@
     };
     document.getElementById('safe-test-severe-critical').onclick = () => {
       postSoundToHudWindow({ type: MSG.PLAY, sound: 'severe', force: true, tier: 'critical' });
+    };
+    document.getElementById('safe-test-severe-sub3000').onclick = () => {
+      postSoundToHudWindow({
+        type: MSG.PLAY,
+        sound: 'severe',
+        force: true,
+        tier: 'sub3000',
+        intensityMul: 2.15,
+        durationMul: 2,
+      });
     };
     document.getElementById('safe-test-severe-scaled').onclick = () => {
       let sc = { intensityMul: 1, durationMul: 1 };
@@ -1255,16 +1416,22 @@
     }
 
     /**
-     * @description Düşüş alarmı: `tier` critical = 100 USD kademesi (uzun/güçlü), simple = 50 USD veya hızlı tekrar.
+     * @description Düşüş alarmı: sub3000 = alt limit altı kademe (en uzun/keskin), critical = 100 USD, simple = 50 USD.
      * @param opts.force - Test için soğuma atlanır; yine de önceki ses durdurulur.
-     * @param opts.tier - critical | simple (yok + quickRepeat yok → critical)
+     * @param opts.tier - sub3000 | critical | simple (yok + quickRepeat yok → critical)
      */
     function playSevere(s, opts = {}) {
       if (!s.severeEnabled) return;
       const ctx = getAudioCtx();
       if (!ctx) return;
 
-      const tier = opts.quickRepeatCooldown ? 'simple' : opts.tier === 'simple' ? 'simple' : 'critical';
+      const tier = opts.quickRepeatCooldown
+        ? 'simple'
+        : opts.tier === 'sub3000'
+          ? 'sub3000'
+          : opts.tier === 'simple'
+            ? 'simple'
+            : 'critical';
 
       const baseVol = opts.useHappyVolume
         ? Math.max(0.0001, Math.min(1, Number(s.happyVolume) || 0.06))
@@ -1274,9 +1441,18 @@
       const durBase = Math.min(2.2, Math.max(0.85, Number(opts.durationMul) || 1));
       let intM = intBase;
       let durM = durBase;
+      let critSynth = null;
       if (tier === 'simple') {
         intM = Math.min(1.42, intBase * 0.66);
         durM = Math.min(1.22, durBase * 0.7);
+      } else if (tier === 'sub3000') {
+        critSynth = sub3000SevereSynthTiming(opts.intensityMul || 1, opts.durationMul || 1);
+        intM = critSynth.intM;
+        durM = critSynth.durM;
+      } else {
+        critSynth = criticalSevereSynthTiming(opts.intensityMul || 1, opts.durationMul || 1);
+        intM = critSynth.intM;
+        durM = critSynth.durM;
       }
 
       const nowWall = performance.now();
@@ -1285,10 +1461,14 @@
         baseCooldownMs = 2200;
       } else if (tier === 'simple') {
         baseCooldownMs = 4800;
+      } else if (tier === 'sub3000') {
+        baseCooldownMs = Math.max(32000, (critSynth || sub3000SevereSynthTiming(1, 1)).totalMs + 3500);
       } else {
-        baseCooldownMs = 11500;
+        baseCooldownMs = Math.max(24000, (critSynth || criticalSevereSynthTiming(1, 1)).totalMs + 2000);
       }
-      const cooldownMs = Math.round(baseCooldownMs * durM);
+      const cooldownMs = Math.round(
+        baseCooldownMs * (tier === 'critical' || tier === 'sub3000' ? 1 : durM),
+      );
       if (!opts.force && audioState.severeCooldownUntil > nowWall) {
         return;
       }
@@ -1296,21 +1476,62 @@
       stopSevereVoicesNow();
 
       const start = ctx.currentTime;
-      const compRatio = Math.min(22, tier === 'critical' ? 16 + intM * 2.2 : 13.5 + intM * 1.35);
-      const comp = compressor(ctx, tier === 'critical' ? -8 - intM * 1.5 : -12 - intM * 1.1, compRatio);
-      const oscCount = tier === 'critical' ? Math.min(110, Math.round(42 * durM + 8)) : Math.min(44, Math.round(17 * durM + 4));
-      const stepSec = tier === 'critical' ? 0.2 / Math.max(0.82, Math.sqrt(intM)) : 0.125 / Math.max(0.88, Math.sqrt(intM));
-      const volPeak = Math.max(0.0001, Math.min(1.28, baseVol * intM));
-      const pulseAttack = tier === 'critical' ? 0.014 : 0.011;
-      const pulseDecayEnd = tier === 'critical' ? 0.52 : 0.24;
-      const pulseStop = tier === 'critical' ? 0.62 : 0.3;
+      let compRatio;
+      let compThr;
+      let oscCount;
+      let stepSec;
+      let volPeak;
+      let pulseAttack;
+      let pulseDecayEnd;
+      let pulseStop;
+      if (tier === 'sub3000' && critSynth) {
+        compRatio = Math.min(22, 20.5 + intM * 2.75);
+        compThr = -3.8 - intM * 2.25;
+        oscCount = critSynth.oscCount;
+        stepSec = critSynth.stepSec;
+        pulseAttack = critSynth.pulseAttack;
+        pulseDecayEnd = critSynth.pulseDecayEnd;
+        pulseStop = critSynth.pulseStop;
+        volPeak = Math.max(0.0001, Math.min(1.38, baseVol * intM * 1.18));
+      } else if (tier === 'critical' && critSynth) {
+        compRatio = Math.min(22, 19.2 + intM * 2.55);
+        compThr = -5.2 - intM * 2.05;
+        oscCount = critSynth.oscCount;
+        stepSec = critSynth.stepSec;
+        pulseAttack = critSynth.pulseAttack;
+        pulseDecayEnd = critSynth.pulseDecayEnd;
+        pulseStop = critSynth.pulseStop;
+        volPeak = Math.max(0.0001, Math.min(1.34, baseVol * intM * 1.1));
+      } else {
+        compRatio = Math.min(22, 13.5 + intM * 1.35);
+        compThr = -12 - intM * 1.1;
+        oscCount = Math.min(44, Math.round(17 * durM + 4));
+        stepSec = 0.125 / Math.max(0.88, Math.sqrt(intM));
+        volPeak = Math.max(0.0001, Math.min(1.28, baseVol * intM));
+        pulseAttack = 0.011;
+        pulseDecayEnd = 0.24;
+        pulseStop = 0.3;
+      }
+      const comp = compressor(ctx, compThr, compRatio);
 
       for (let i = 0; i < oscCount; i++) {
         const t = start + i * stepSec;
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
-        osc.type = i % 3 === 0 ? 'square' : i % 3 === 1 ? 'sawtooth' : 'triangle';
-        osc.frequency.setValueAtTime(i % 2 === 0 ? 1600 : 900, t);
+        if (tier === 'sub3000' && critSynth) {
+          osc.type = i % 3 === 0 ? 'square' : 'sawtooth';
+          const lo = 200 + (i % 12) * 38;
+          const hi = 620 + (i % 10) * 58;
+          osc.frequency.setValueAtTime(i % 2 === 0 ? hi : lo, t);
+        } else if (tier === 'critical' && critSynth) {
+          osc.type = i % 2 === 0 ? 'square' : 'sawtooth';
+          const lo = 260 + (i % 9) * 40;
+          const hi = 500 + (i % 7) * 44;
+          osc.frequency.setValueAtTime(i % 2 === 0 ? hi : lo, t);
+        } else {
+          osc.type = i % 3 === 0 ? 'square' : i % 3 === 1 ? 'sawtooth' : 'triangle';
+          osc.frequency.setValueAtTime(i % 2 === 0 ? 1600 : 900, t);
+        }
         gain.gain.setValueAtTime(0.0001, t);
         gain.gain.exponentialRampToValueAtTime(volPeak, t + pulseAttack);
         gain.gain.exponentialRampToValueAtTime(0.0001, t + pulseDecayEnd);
@@ -1498,11 +1719,14 @@
     win.__safeHudPopupClickUnlock = onClickUnlock;
     win.addEventListener('click', onClickUnlock, { passive: true });
 
-    d.getElementById('safe-popup-focus-opener').onclick = () => {
-      try {
-        if (win.opener && !win.opener.closed) win.opener.focus();
-      } catch (e) {}
-    };
+    const focusOpenerBtn = d.getElementById('safe-popup-focus-opener');
+    if (focusOpenerBtn) {
+      focusOpenerBtn.onclick = () => {
+        try {
+          if (win.opener && !win.opener.closed) win.opener.focus();
+        } catch (e) {}
+      };
+    }
 
     try {
       if (win.opener && typeof win.opener.safeHudBeginPopupPolling === 'function') {
@@ -1716,9 +1940,16 @@
     }
 
     const prevSample = state.lastWalletPrice;
-    if (prevSample != null && currentPrice > prevSample && state.severePlaybackUntil > performance.now()) {
-      state.severePlaybackUntil = 0;
-      notifyStopSevere();
+    const recoveryWindow =
+      state.severePlaybackUntil > performance.now() || performance.now() < (state.criticalVoiceUntil || 0);
+    if (prevSample != null && currentPrice > prevSample && recoveryWindow) {
+      if (performance.now() < (state.criticalVoiceUntil || 0)) {
+        /* 100 USD kritik: sekans bitene kadar kesme (uyanma) */
+      } else {
+        state.severePlaybackUntil = 0;
+        state.criticalVoiceUntil = 0;
+        notifyStopSevere();
+      }
     }
 
     if (state.lastWalletPrice === null) {
@@ -1831,6 +2062,7 @@
     state.severeAwaitDepth.clear();
     state.consecutiveDownStreak = 0;
     state.lastHappyGlobalAt = 0;
+    state.criticalVoiceUntil = 0;
   }
 
   /**
