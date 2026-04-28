@@ -426,8 +426,7 @@
     if (sound !== 'severe') return;
 
     const durationMul = meta.durationMul ?? 1;
-    const tier =
-      meta.tier === 'sub3000' ? 'sub3000' : meta.tier === 'critical' ? 'critical' : 'simple';
+    const tier = meta.tier === 'sub3000' ? 'sub3000' : meta.tier === 'critical' ? 'critical' : 'simple';
     const quickRepeat = !!meta.quickRepeatCooldown;
     let skipRecoveryStopWindow;
     if (meta.skipRecoveryStopWindow === true) skipRecoveryStopWindow = true;
@@ -1005,12 +1004,9 @@
   function buildHudPopupHtml(s) {
     return `
 <div id="sh-app" class="${s.privacyOfficeMode ? 'sh-privacy' : ''}">
-  <div style="padding:10px 16px 0;">
-    <button type="button" id="safe-popup-focus-opener" class="sh-btn sh-btn-quiet" style="padding:6px 10px;font-size:12px;">Ana sekme</button>
-  </div>
+  
   <div id="safe-hud-display" class="sh-hud" style="width:${s.hudWidth}px;margin:14px 16px 20px;">
     <div class="sh-hud-inner">
-      <div class="sh-hud-label" id="safe-hud-main-label">Canlı özet</div>
       <div class="sh-hud-wallet-wrap">
         <div id="safe-hud-wallet" class="sh-hud-wallet">-</div>
       </div>
@@ -1466,9 +1462,7 @@
       } else {
         baseCooldownMs = Math.max(24000, (critSynth || criticalSevereSynthTiming(1, 1)).totalMs + 2000);
       }
-      const cooldownMs = Math.round(
-        baseCooldownMs * (tier === 'critical' || tier === 'sub3000' ? 1 : durM),
-      );
+      const cooldownMs = Math.round(baseCooldownMs * (tier === 'critical' || tier === 'sub3000' ? 1 : durM));
       if (!opts.force && audioState.severeCooldownUntil > nowWall) {
         return;
       }
@@ -1940,8 +1934,7 @@
     }
 
     const prevSample = state.lastWalletPrice;
-    const recoveryWindow =
-      state.severePlaybackUntil > performance.now() || performance.now() < (state.criticalVoiceUntil || 0);
+    const recoveryWindow = state.severePlaybackUntil > performance.now() || performance.now() < (state.criticalVoiceUntil || 0);
     if (prevSample != null && currentPrice > prevSample && recoveryWindow) {
       if (performance.now() < (state.criticalVoiceUntil || 0)) {
         /* 100 USD kritik: sekans bitene kadar kesme (uyanma) */
