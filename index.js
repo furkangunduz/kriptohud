@@ -15,6 +15,8 @@
 
   /** Kayar pencere: son 1 dakikadaki zirveden bugüne düşüş (USD) alarm şiddetini belirler */
   const PRICE_ROLLING_WINDOW_MS = 1 * 60 * 1000;
+  /** Cüzdan sayısı bu kadar ms değişmezse tek seferlik uyarı */
+  const WALLET_FLAT_STALE_MS = 60 * 1000;
   /** Bu düşüşte tam “güçlü” ölçek kabul edilir (üstü daha da artar, tavan kodda) */
   const SEVERE_DROP_REF_USD = 200;
 
@@ -126,6 +128,12 @@
     lastHappyGlobalAt: 0,
     /** @description 100 USD kritik alarm bitene kadar fiyat yukarı gelse bile STOP gönderilmez */
     criticalVoiceUntil: 0,
+    /** @description Durgunluk alarmı: son görülen cüzdan USD (aynı kaldı mı diye) */
+    walletFlatAnchorPrice: null,
+    /** @description epoch ms — walletFlatAnchorPrice bu fiyata oturduğu an */
+    walletFlatAnchorAt: 0,
+    /** @description Bu fiyat bandında durgunluk sesi bir kez çalındı; fiyat değişene kadar tekrar yok */
+    walletFlatAlarmed: false,
   };
 
   function save() {
@@ -415,6 +423,55 @@
     state.priceHistory.push({ t, p: price });
     const cutoff = t - PRICE_ROLLING_WINDOW_MS - 5000;
     state.priceHistory = state.priceHistory.filter((row) => row.t >= cutoff);
+  }
+
+  function resetWalletFlatWatch() {
+    state.walletFlatAnchorPrice = null;
+    state.walletFlatAnchorAt = 0;
+    state.walletFlatAlarmed = false;
+  }
+
+  /**
+   * @description Cüzdan USD değeri WALLET_FLAT_STALE_MS boyunca aynı kalırsa bir kez ses (fiyat değişince sıfırlanır).
+   */
+  function checkWalletFlatStale(currentPrice) {
+    if (currentPrice == null || !Number.isFinite(currentPrice)) {
+      resetWalletFlatWatch();
+      return;
+    }
+    const now = Date.now();
+    if (state.walletFlatAnchorPrice == null) {
+      state.walletFlatAnchorPrice = currentPrice;
+      state.walletFlatAnchorAt = now;
+      state.walletFlatAlarmed = false;
+      return;
+    }
+    if (currentPrice !== state.walletFlatAnchorPrice) {
+      state.walletFlatAnchorPrice = currentPrice;
+      state.walletFlatAnchorAt = now;
+      state.walletFlatAlarmed = false;
+      return;
+    }
+    if (state.walletFlatAlarmed) return;
+    if (now - state.walletFlatAnchorAt < WALLET_FLAT_STALE_MS) return;
+    state.walletFlatAlarmed = true;
+    debugAlarmTrigger('FLAT_WALLET', {
+      price: currentPrice,
+      staleMs: now - state.walletFlatAnchorAt,
+    });
+    if (settings.severeEnabled) {
+      emitPlaySound('severe', {
+        tier: 'simple',
+        quickRepeatCooldown: true,
+        skipRecoveryStopWindow: true,
+        intensityMul: 1,
+        durationMul: 0.95,
+      });
+    } else if (settings.happyEnabled) {
+      const play = { type: MSG.PLAY, sound: 'happy', force: true };
+      if (state.popupPollsOpener) state.pendingSounds.push(play);
+      else postToPopup(play);
+    }
   }
 
   /**
@@ -1554,6 +1611,66 @@
       }
     }
 
+    /**
+     * @description Yükseliş sesi: kısa, daha yumuşak ve yukarı kayan ton.
+     */
+    function playHappy(s, opts = {}) {
+      if (!s.happyEnabled) return;
+      const ctx = getAudioCtx();
+      if (!ctx) return;
+
+      const vol = Math.max(0.0001, Math.min(1, Number(s.happyVolume) || 0.06));
+      const start = ctx.currentTime;
+      const comp = compressor(ctx, -18, 8);
+      const master = ctx.createGain();
+      master.gain.setValueAtTime(0.0001, start);
+      master.gain.exponentialRampToValueAtTime(Math.min(0.35, vol * 1.8), start + 0.025);
+      master.gain.exponentialRampToValueAtTime(0.0001, start + 0.28);
+      master.connect(comp);
+
+      const tones = [
+        { from: 520, to: 700, at: 0.0, len: 0.16, type: 'sine' },
+        { from: 780, to: 1060, at: 0.045, len: 0.17, type: 'triangle' },
+      ];
+
+      tones.forEach((t) => {
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        const t0 = start + t.at;
+        const t1 = t0 + t.len;
+        osc.type = t.type;
+        osc.frequency.setValueAtTime(t.from, t0);
+        osc.frequency.exponentialRampToValueAtTime(t.to, t1);
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(1, t0 + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t1);
+        osc.connect(g);
+        g.connect(master);
+        osc.start(t0);
+        osc.stop(t1 + 0.02);
+      });
+
+      const click = ctx.createOscillator();
+      const clickGain = ctx.createGain();
+      click.type = 'sine';
+      click.frequency.setValueAtTime(1400, start + 0.12);
+      click.frequency.exponentialRampToValueAtTime(1750, start + 0.2);
+      clickGain.gain.setValueAtTime(0.0001, start + 0.12);
+      clickGain.gain.exponentialRampToValueAtTime(Math.min(0.6, vol * 2.8), start + 0.135);
+      clickGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.22);
+      click.connect(clickGain);
+      clickGain.connect(master);
+      click.start(start + 0.12);
+      click.stop(start + 0.24);
+
+      setTimeout(() => {
+        try {
+          master.disconnect();
+          comp.disconnect();
+        } catch (e) {}
+      }, 420);
+    }
+
     function parseHudRowPnl(txt) {
       const normalized = (txt || '').replace(/[^0-9.,-]/g, '').replace(/,/g, '');
       const n = parseFloat(normalized);
@@ -1693,15 +1810,7 @@
             });
           }
           if (ev.data.sound === 'happy') {
-            playSevere(s, {
-              force: !!ev.data.force,
-              intensityMul: 1,
-              durationMul: 1,
-              skipRecoveryStopWindow: true,
-              quickRepeatCooldown: true,
-              tier: 'simple',
-              useHappyVolume: true,
-            });
+            playHappy(s, { force: !!ev.data.force });
           }
         });
       }
@@ -1928,6 +2037,7 @@
 
     const currentPrice = getWalletPrice();
     if (currentPrice == null) {
+      resetWalletFlatWatch();
       const sounds = [...state.pendingSounds];
       state.pendingSounds.length = 0;
       return { payload, sounds };
@@ -1957,6 +2067,7 @@
     }
 
     recordPriceSample(currentPrice);
+    checkWalletFlatStale(currentPrice);
 
     const sounds = [...state.pendingSounds];
     state.pendingSounds.length = 0;
@@ -2056,6 +2167,7 @@
     state.consecutiveDownStreak = 0;
     state.lastHappyGlobalAt = 0;
     state.criticalVoiceUntil = 0;
+    resetWalletFlatWatch();
   }
 
   /**
