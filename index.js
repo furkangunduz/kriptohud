@@ -57,6 +57,25 @@
 
     severeEnabled: true,
     happyEnabled: true,
+    alarmEngineMode: 'systematic',
+    smallUpEnabled: true,
+    smallDownEnabled: true,
+    bigUpEnabled: true,
+    bigDownEnabled: true,
+    criticalDropEnabled: true,
+    smallUpUsd: 25,
+    smallDownUsd: 25,
+    bigUpUsd: 100,
+    bigDownUsd: 100,
+    criticalDropUsd: 180,
+    smallAlarmVolume: 0.06,
+    bigAlarmVolume: 0.08,
+    criticalAlarmVolume: 0.16,
+    smallAlarmCooldownMs: 5000,
+    bigAlarmCooldownMs: 14000,
+    criticalAlarmCooldownMs: 45000,
+    criticalRollingWindowMs: 60000,
+    hudSurface: 'popup',
     /** @description 50’lik banda girince değil, band + bu USD (ör. 1500 → 1505+) ile yükseliş sesi */
     happyUpBufferUsd: 5,
     severeVolume: 0.06,
@@ -134,6 +153,13 @@
     walletFlatAnchorAt: 0,
     /** @description Bu fiyat bandında durgunluk sesi bir kez çalındı; fiyat değişene kadar tekrar yok */
     walletFlatAlarmed: false,
+    /** @description Sistematik alarm profilleri için tekrar engeli: profile:direction:level */
+    movementLatchedLevels: new Set(),
+    /** @description Profil bazlı cooldown zamanları */
+    alarmCooldownUntil: {},
+    /** @description Kritik düşüş, fiyat toparlanmadan tekrar etmesin */
+    criticalDropLatched: false,
+    inlineHudEl: null,
   };
 
   function save() {
@@ -326,6 +352,9 @@
 
   function postToPopup(payload) {
     try {
+      if ((settings.hudSurface || 'popup') === 'inline' && payload?.type === MSG.UPDATE) {
+        applyInlineHudUpdate(payload?.payload || payload);
+      }
       if (state.hudWindow && !state.hudWindow.closed) {
         state.hudWindow.postMessage(payload, '*');
       }
@@ -470,6 +499,7 @@
     } else if (settings.happyEnabled) {
       const play = { type: MSG.PLAY, sound: 'happy', force: true };
       if (state.popupPollsOpener) state.pendingSounds.push(play);
+      else if ((settings.hudSurface || 'popup') === 'inline') playLocalSound(play);
       else postToPopup(play);
     }
   }
@@ -508,6 +538,7 @@
       sound: 'severe',
       intensityMul: meta.intensityMul ?? 1,
       durationMul,
+      volumeOverride: meta.volumeOverride,
       skipRecoveryStopWindow,
       quickRepeatCooldown: quickRepeat,
       tier,
@@ -521,7 +552,9 @@
       criticalVoiceUntil: Math.round(state.criticalVoiceUntil || 0),
       severePlaybackUntil: Math.round(state.severePlaybackUntil || 0),
     });
-    if (state.popupPollsOpener) {
+    if ((settings.hudSurface || 'popup') === 'inline' && !state.popupPollsOpener) {
+      playLocalSound({ type: MSG.PLAY, ...play });
+    } else if (state.popupPollsOpener) {
       state.pendingSounds.push(play);
     } else {
       postToPopup({ type: MSG.PLAY, ...play });
@@ -533,6 +566,10 @@
    */
   function notifyStopSevere() {
     try {
+      if ((settings.hudSurface || 'popup') === 'inline') {
+        stopLocalSevereVoicesNow();
+        return;
+      }
       if (state.popupPollsOpener && state.popupWinRef && !state.popupWinRef.closed) {
         state.popupWinRef.postMessage({ type: MSG.STOP_SEVERE }, '*');
       } else if (state.hudWindow && !state.hudWindow.closed) {
@@ -751,6 +788,8 @@
         const play = { type: MSG.PLAY, sound: 'happy', force: false };
         if (state.popupPollsOpener) {
           state.pendingSounds.push(play);
+        } else if ((settings.hudSurface || 'popup') === 'inline') {
+          playLocalSound(play);
         } else {
           postToPopup(play);
         }
@@ -766,6 +805,197 @@
     } else if (curr50 === prev50) {
       tryEmitForThreshold(curr50 + buf);
     }
+  }
+
+  function numSetting(key, fallback, min, max) {
+    const n = Number(settings[key]);
+    const safe = Number.isFinite(n) ? n : fallback;
+    return Math.min(max, Math.max(min, safe));
+  }
+
+  function profileCooldownMs(profileKey) {
+    if (profileKey === 'critical') return numSetting('criticalAlarmCooldownMs', 45000, 5000, 10 * 60 * 1000);
+    if (profileKey === 'big') return numSetting('bigAlarmCooldownMs', 14000, 1000, 5 * 60 * 1000);
+    return numSetting('smallAlarmCooldownMs', 5000, 0, 2 * 60 * 1000);
+  }
+
+  function alarmVolumeFor(profileKey) {
+    if (profileKey === 'critical') return numSetting('criticalAlarmVolume', 0.16, 0, 1);
+    if (profileKey === 'big') return numSetting('bigAlarmVolume', 0.08, 0, 1);
+    return numSetting('smallAlarmVolume', 0.06, 0, 1);
+  }
+
+  function getMovementProfiles() {
+    return [
+      {
+        key: 'small-up',
+        group: 'small',
+        label: 'Ufak yükseliş',
+        direction: 'up',
+        enabled: !!settings.smallUpEnabled,
+        step: numSetting('smallUpUsd', 25, 1, 100000),
+        sound: 'happy',
+      },
+      {
+        key: 'small-down',
+        group: 'small',
+        label: 'Ufak düşüş',
+        direction: 'down',
+        enabled: !!settings.smallDownEnabled,
+        step: numSetting('smallDownUsd', 25, 1, 100000),
+        sound: 'severe',
+        tier: 'simple',
+      },
+      {
+        key: 'big-up',
+        group: 'big',
+        label: 'Büyük yükseliş',
+        direction: 'up',
+        enabled: !!settings.bigUpEnabled,
+        step: numSetting('bigUpUsd', 100, 1, 100000),
+        sound: 'happy',
+        force: true,
+      },
+      {
+        key: 'big-down',
+        group: 'big',
+        label: 'Büyük düşüş',
+        direction: 'down',
+        enabled: !!settings.bigDownEnabled,
+        step: numSetting('bigDownUsd', 100, 1, 100000),
+        sound: 'severe',
+        tier: 'critical',
+      },
+    ];
+  }
+
+  function resetMovementLatchesAroundPrice(price) {
+    const rear = numSetting('rearmOffset', 5, 0, 500);
+    for (const raw of [...state.movementLatchedLevels]) {
+      const parts = String(raw).split(':');
+      const dir = parts[1];
+      const level = Number(parts[2]);
+      if (!Number.isFinite(level)) {
+        state.movementLatchedLevels.delete(raw);
+        continue;
+      }
+      if (dir === 'up' && price <= level - rear) state.movementLatchedLevels.delete(raw);
+      if (dir === 'down' && price >= level + rear) state.movementLatchedLevels.delete(raw);
+    }
+  }
+
+  function emitSystematicAlarm(profile, level, detail = {}) {
+    const now = performance.now();
+    const cooldownKey = profile.group || profile.key;
+    const until = state.alarmCooldownUntil[cooldownKey] || 0;
+    if (until > now && !detail.force) return false;
+    state.alarmCooldownUntil[cooldownKey] = now + profileCooldownMs(cooldownKey);
+
+    const vol = alarmVolumeFor(cooldownKey);
+    const base = {
+      profile: profile.key,
+      label: profile.label,
+      direction: profile.direction,
+      level,
+      price: detail.price,
+      delta: detail.delta,
+    };
+    debugAlarmTrigger('SYSTEMATIC', base);
+
+    if (profile.sound === 'happy') {
+      const play = { type: MSG.PLAY, sound: 'happy', force: !!profile.force, volumeOverride: vol };
+      if (state.popupPollsOpener) state.pendingSounds.push(play);
+      else if ((settings.hudSurface || 'popup') === 'inline') playLocalSound(play);
+      else postToPopup(play);
+      return true;
+    }
+
+    const intensityMul =
+      cooldownKey === 'critical' ? 2.35 : cooldownKey === 'big' ? 1.45 : Math.max(0.7, Math.min(1.1, vol / 0.06));
+    const durationMul = cooldownKey === 'critical' ? 2.1 : cooldownKey === 'big' ? 1.3 : 0.75;
+    const tier = profile.tier || (cooldownKey === 'critical' ? 'sub3000' : cooldownKey === 'big' ? 'critical' : 'simple');
+    if ((settings.hudSurface || 'popup') === 'inline' && !state.popupPollsOpener) {
+      playLocalSound({
+        type: MSG.PLAY,
+        sound: 'severe',
+        force: cooldownKey === 'critical',
+        tier,
+        intensityMul,
+        durationMul,
+        volumeOverride: vol,
+      });
+    } else {
+      emitPlaySound('severe', {
+        tier,
+        intensityMul,
+        durationMul,
+        volumeOverride: vol,
+        quickRepeatCooldown: cooldownKey === 'small',
+        skipRecoveryStopWindow: cooldownKey === 'small',
+      });
+    }
+    return true;
+  }
+
+  function crossedMovementLevels(prevPrice, currentPrice, step, direction) {
+    const levels = [];
+    if (direction === 'up') {
+      const first = Math.floor(prevPrice / step) * step + step;
+      for (let level = first; level <= currentPrice; level += step) levels.push(level);
+    } else {
+      const first = Math.ceil(prevPrice / step) * step - step;
+      for (let level = first; level >= currentPrice; level -= step) levels.push(level);
+    }
+    return levels.slice(0, 8);
+  }
+
+  function checkSystematicMovementAlarms(prevPrice, currentPrice) {
+    if (settings.alarmEngineMode !== 'systematic') {
+      checkSevereCrossings(prevPrice, currentPrice);
+      checkHappy50Up(prevPrice, currentPrice);
+      return;
+    }
+    if (prevPrice == null || currentPrice == null || prevPrice === currentPrice) return;
+    resetMovementLatchesAroundPrice(currentPrice);
+    const dir = currentPrice > prevPrice ? 'up' : 'down';
+    const profiles = getMovementProfiles().filter((p) => p.enabled && p.direction === dir);
+    for (const profile of profiles) {
+      const levels = crossedMovementLevels(prevPrice, currentPrice, profile.step, dir);
+      for (const level of levels) {
+        const latchKey = `${profile.key}:${dir}:${level}`;
+        if (state.movementLatchedLevels.has(latchKey)) continue;
+        if (emitSystematicAlarm(profile, level, { price: currentPrice, delta: currentPrice - prevPrice })) {
+          state.movementLatchedLevels.add(latchKey);
+        }
+      }
+    }
+  }
+
+  function checkCriticalRollingDrop(currentPrice) {
+    if (settings.alarmEngineMode !== 'systematic') return;
+    if (!settings.criticalDropEnabled) return;
+    if (currentPrice == null || !Number.isFinite(currentPrice)) return;
+    const windowMs = numSetting('criticalRollingWindowMs', 60000, 5000, 10 * 60 * 1000);
+    const dropUsd = getDropUsdInRollingWindow(currentPrice, windowMs);
+    const threshold = numSetting('criticalDropUsd', 180, 1, 100000);
+    const rear = Math.max(5, numSetting('rearmOffset', 5, 0, 500));
+    if (state.criticalDropLatched && dropUsd <= Math.max(0, threshold - rear)) {
+      state.criticalDropLatched = false;
+    }
+    if (state.criticalDropLatched || dropUsd < threshold) return;
+    state.criticalDropLatched = true;
+    emitSystematicAlarm(
+      {
+        key: 'critical-drop',
+        group: 'critical',
+        label: 'Kritik düşüş',
+        direction: 'down',
+        sound: 'severe',
+        tier: 'sub3000',
+      },
+      Math.round(currentPrice),
+      { price: currentPrice, delta: -dropUsd, force: true },
+    );
   }
 
   /**
@@ -812,6 +1042,7 @@
     return `
       #sh-app { min-height:100vh; background:var(--sh-bg); color:var(--sh-text); color-scheme:dark;
         font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif; -webkit-font-smoothing:antialiased; }
+      #sh-app.sh-popup-compact { min-height:0; background:#080d12; }
       #sh-app.sh-privacy { --sh-up:#9aa3b2; --sh-down:#9aa3b2; }
       :root {
         --sh-bg:#0b0f14;
@@ -836,22 +1067,31 @@
         box-shadow:0 0 12px rgba(61,125,214,0.28); }
       .sh-top-title { font-size:14px; font-weight:650; letter-spacing:-0.02em; }
       .sh-top-hint { font-size:11px; color:var(--sh-muted); max-width:min(380px,92vw); line-height:1.4; }
-      .sh-btn { border:0; border-radius:10px; padding:9px 14px; font-size:13px; font-weight:600; cursor:pointer;
+      .sh-btn { border:0; border-radius:8px; padding:8px 12px; font-size:12px; font-weight:700; cursor:pointer;
         transition:opacity .15s, transform .12s; }
       .sh-btn:focus-visible { outline:2px solid var(--sh-accent); outline-offset:2px; }
       .sh-btn:active { transform:scale(0.98); }
       .sh-btn-primary { background:linear-gradient(180deg,#4588e0,#2f6ab8); color:#fff; box-shadow:0 4px 16px rgba(47,106,184,0.32); }
-      .sh-btn-quiet { background:#222c3b; color:var(--sh-text); border:1px solid var(--sh-line); }
-      .sh-card { margin:14px 16px; background:var(--sh-card); border:1px solid var(--sh-line); border-radius:14px; overflow:hidden;
+      .sh-btn-quiet { background:#202a38; color:var(--sh-text); border:1px solid #314056; }
+      .sh-btn-danger { background:#3a2026; color:#ffd6dc; border:1px solid #5b303b; }
+      .sh-btn-good { background:#173424; color:#d8ffe8; border:1px solid #285f41; }
+      .sh-test-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin:0 0 14px; }
+      .sh-test-actions .sh-btn { width:100%; min-height:34px; }
+      .sh-section { margin:0 0 12px; padding:10px; border:1px solid var(--sh-line); border-radius:10px; background:#0d141d; }
+      .sh-section-head { display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:10px; }
+      .sh-section-title { font-size:13px; font-weight:800; color:var(--sh-text); }
+      .sh-alarm-grid { display:grid; grid-template-columns:minmax(104px,1fr) auto 92px; gap:7px 9px; align-items:center; font-size:12px; }
+      .sh-alarm-grid label { color:var(--sh-muted); }
+      .sh-card { margin:12px 14px; background:var(--sh-card); border:1px solid var(--sh-line); border-radius:12px; overflow:hidden;
         box-shadow:0 12px 40px rgba(0,0,0,0.28); }
-      .sh-card-h { padding:12px 16px; background:rgba(255,255,255,0.025); border-bottom:1px solid var(--sh-line);
+      .sh-card-h { padding:10px 12px; background:rgba(255,255,255,0.025); border-bottom:1px solid var(--sh-line);
         display:flex; justify-content:space-between; align-items:center; gap:8px; }
       .sh-card-h strong { font-size:14px; letter-spacing:-0.01em; }
-      .sh-card-body { padding:14px 16px 16px; }
+      .sh-card-body { padding:12px; }
       .sh-grid { display:grid; grid-template-columns:1fr auto; gap:10px 12px; align-items:center; font-size:13px; }
       .sh-grid label { color:var(--sh-muted); }
-      .sh-inp, .sh-select { width:100%; max-width:100%; padding:8px 10px; border-radius:8px; border:1px solid var(--sh-line);
-        background:#0a1018; color:var(--sh-text); box-sizing:border-box; font-size:13px; }
+      .sh-inp, .sh-select { width:100%; max-width:100%; padding:7px 9px; border-radius:7px; border:1px solid var(--sh-line);
+        background:#0a1018; color:var(--sh-text); box-sizing:border-box; font-size:12px; }
       .sh-hud { margin:0 auto 20px; padding:0; background:transparent; border:0; border-radius:0; box-sizing:border-box;
         overflow:visible; box-shadow:none; max-width:100%; }
       .sh-hud-inner { padding:18px 18px 16px; background:linear-gradient(180deg,#131b26 0%,#0e141c 100%);
@@ -883,6 +1123,19 @@
       .sh-tone-office-neg { color:#b89a9a; }
       .sh-status { margin-top:14px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.06); font-size:10px; color:var(--sh-muted);
         letter-spacing:0.02em; }
+      .sh-popup-compact .sh-hud { width:100% !important; margin:0 !important; }
+      .sh-popup-compact .sh-hud-inner { padding:6px; border:0; border-radius:0; box-shadow:none; min-height:100vh; background:#080d12; }
+      .sh-popup-compact .sh-hud-wallet-wrap { margin:0 0 4px; padding:4px 5px; border-radius:6px; background:#0e151e; }
+      .sh-popup-compact .sh-row { padding:4px 5px; margin:0; width:100%; max-width:100%; border-radius:5px; gap:6px; }
+      .sh-popup-compact .sh-row + .sh-row { margin-top:1px; }
+      .sh-popup-compact .sh-row-right { gap:1px; max-width:62%; }
+      .sh-popup-compact .sh-status { margin-top:5px; padding-top:5px; font-size:9px; }
+      #safe-hud-inline-root #sh-app { min-height:0; }
+      #safe-hud-inline-root .sh-popup-compact .sh-hud-inner { min-height:0; border:1px solid var(--sh-line); border-top:0; }
+      @media (max-width:430px) {
+        .sh-test-actions { grid-template-columns:1fr; }
+        .sh-alarm-grid { grid-template-columns:minmax(92px,1fr) auto 78px; }
+      }
     `;
   }
 
@@ -935,14 +1188,70 @@
     <label style="display:block;font-size:11px;color:var(--sh-muted);margin-bottom:4px;">PnL kök CSS</label>
     <input id="safe-pnl-selector" class="sh-inp" type="text" value="${pSel}" placeholder=".unrealized-pnl-value" style="margin-bottom:14px;">
 
-    <p style="margin:0 0 8px;font-size:11px;color:var(--sh-muted);line-height:1.4;">Düşüş alarmı yalnızca <strong>100 USD</strong> kademelerinde; 50’lik geçişlerde çalmaz. Alt limit ve altındaki 100’lüklerde ekstra uzun/keskin alarm. Onay derinliği + ardışık düşüş tick ile tetiklenir.</p>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-happy">Ses testi (yükseliş)</button>
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe" title="50 USD kademesi — kısa / hafif">50 USD (basit)</button>
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-critical" title="100 USD kademesi — uzun / güçlü">100 USD (kritik)</button>
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-sub3000" title="Alt limit altı kademe — en uzun / en keskin">Alt limit alarm</button>
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-scaled" title="Kaynak sekmede son 1 dk düşüşüne göre, kritik">Kritik ölçekli</button>
-      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-demo-max" title="Yaklaşık maksimum süre ve şiddet, kritik">Kritik max</button>
+    <div class="sh-section">
+      <div class="sh-section-head">
+        <strong class="sh-section-title">Alarm sistemi</strong>
+        <select id="safe-alarm-engine-mode" class="sh-select" style="max-width:190px;">
+          <option value="systematic" ${(s.alarmEngineMode || 'systematic') === 'systematic' ? 'selected' : ''}>Sistematik</option>
+          <option value="legacy" ${s.alarmEngineMode === 'legacy' ? 'selected' : ''}>Eski grid</option>
+        </select>
+      </div>
+      <div class="sh-alarm-grid">
+        <label>Ufak yükseliş</label>
+        <input id="safe-small-up-enabled" type="checkbox" ${s.smallUpEnabled ? 'checked' : ''}>
+        <input id="safe-small-up-usd" class="sh-inp" type="number" min="1" step="1" value="${Number.isFinite(s.smallUpUsd) ? s.smallUpUsd : 25}" title="Her kaç USD yükselişte çalsın">
+        <label>Ufak düşüş</label>
+        <input id="safe-small-down-enabled" type="checkbox" ${s.smallDownEnabled ? 'checked' : ''}>
+        <input id="safe-small-down-usd" class="sh-inp" type="number" min="1" step="1" value="${Number.isFinite(s.smallDownUsd) ? s.smallDownUsd : 25}" title="Her kaç USD düşüşte çalsın">
+        <label>Büyük yükseliş</label>
+        <input id="safe-big-up-enabled" type="checkbox" ${s.bigUpEnabled ? 'checked' : ''}>
+        <input id="safe-big-up-usd" class="sh-inp" type="number" min="1" step="1" value="${Number.isFinite(s.bigUpUsd) ? s.bigUpUsd : 100}">
+        <label>Büyük düşüş</label>
+        <input id="safe-big-down-enabled" type="checkbox" ${s.bigDownEnabled ? 'checked' : ''}>
+        <input id="safe-big-down-usd" class="sh-inp" type="number" min="1" step="1" value="${Number.isFinite(s.bigDownUsd) ? s.bigDownUsd : 100}">
+        <label>Kritik düşüş</label>
+        <input id="safe-critical-drop-enabled" type="checkbox" ${s.criticalDropEnabled ? 'checked' : ''}>
+        <input id="safe-critical-drop-usd" class="sh-inp" type="number" min="1" step="1" value="${Number.isFinite(s.criticalDropUsd) ? s.criticalDropUsd : 180}">
+      </div>
+      <div id="safe-alarm-summary" style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:11px;color:var(--sh-muted);line-height:1.45;"></div>
+    </div>
+
+    <div class="sh-grid" style="margin-bottom:14px;">
+      <label>HUD konumu</label>
+      <select id="safe-hud-surface" class="sh-select" style="max-width:240px;">
+        <option value="popup" ${(s.hudSurface || 'popup') === 'popup' ? 'selected' : ''}>Ayrı pencere</option>
+        <option value="inline" ${s.hudSurface === 'inline' ? 'selected' : ''}>Aynı sayfada hareketli div</option>
+      </select>
+      <label>Ufak ses</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-small-alarm-volume" type="range" min="0" max="1" step="0.01" value="${Number.isFinite(s.smallAlarmVolume) ? s.smallAlarmVolume : 0.06}">
+        <span id="safe-small-alarm-volume-val">${(Number.isFinite(s.smallAlarmVolume) ? s.smallAlarmVolume : 0.06).toFixed(2)}</span>
+      </div>
+      <label>Büyük ses</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-big-alarm-volume" type="range" min="0" max="1" step="0.01" value="${Number.isFinite(s.bigAlarmVolume) ? s.bigAlarmVolume : 0.08}">
+        <span id="safe-big-alarm-volume-val">${(Number.isFinite(s.bigAlarmVolume) ? s.bigAlarmVolume : 0.08).toFixed(2)}</span>
+      </div>
+      <label>Kritik ses</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-critical-alarm-volume" type="range" min="0" max="1" step="0.01" value="${Number.isFinite(s.criticalAlarmVolume) ? s.criticalAlarmVolume : 0.16}">
+        <span id="safe-critical-alarm-volume-val">${(Number.isFinite(s.criticalAlarmVolume) ? s.criticalAlarmVolume : 0.16).toFixed(2)}</span>
+      </div>
+      <label>Kritik pencere (sn)</label>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input id="safe-critical-window" type="range" min="10" max="180" step="5" value="${Math.round((Number.isFinite(s.criticalRollingWindowMs) ? s.criticalRollingWindowMs : 60000) / 1000)}">
+        <span id="safe-critical-window-val">${Math.round((Number.isFinite(s.criticalRollingWindowMs) ? s.criticalRollingWindowMs : 60000) / 1000)}</span>
+      </div>
+    </div>
+
+    <p style="margin:0 0 8px;font-size:11px;color:var(--sh-muted);line-height:1.4;">Eski grid modu: düşüş alarmı yalnızca <strong>100 USD</strong> kademelerinde; alt limit ve altındaki 100’lüklerde ekstra uzun/keskin alarm çalar.</p>
+    <div class="sh-test-actions">
+      <button type="button" class="sh-btn sh-btn-good" id="safe-test-happy">Yükseliş testi</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe" title="50 USD kademesi — kısa / hafif">Basit düşüş</button>
+      <button type="button" class="sh-btn sh-btn-danger" id="safe-test-severe-critical" title="100 USD kademesi — uzun / güçlü">Kritik düşüş</button>
+      <button type="button" class="sh-btn sh-btn-danger" id="safe-test-severe-sub3000" title="Alt limit altı kademe — en uzun / en keskin">Uyandıran alarm</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-scaled" title="Kaynak sekmede son 1 dk düşüşüne göre, kritik">Ölçekli test</button>
+      <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe-demo-max" title="Yaklaşık maksimum süre ve şiddet, kritik">Maksimum test</button>
     </div>
 
     <div class="sh-grid">
@@ -955,9 +1264,9 @@
       <input id="safe-discreet-title" class="sh-inp" type="text" value="${dTitle}" placeholder="Çalışma özeti" style="grid-column:1/-1;margin-bottom:8px;">
       <label>Orijinalleri gizle</label>
       <input id="safe-hide-originals" type="checkbox" ${s.hideOriginals ? 'checked' : ''}>
-      <label>Ağır alarm</label>
+      <label>Düşüş ses motoru</label>
       <input id="safe-severe-enabled" type="checkbox" ${s.severeEnabled ? 'checked' : ''}>
-      <label>50 yükseliş sesi</label>
+      <label>Yükseliş ses motoru</label>
       <input id="safe-happy-enabled" type="checkbox" ${s.happyEnabled ? 'checked' : ''}>
       <label>Yükseliş tamponu (USD)</label>
       <div style="display:flex;align-items:center;gap:8px;">
@@ -1060,9 +1369,9 @@
    */
   function buildHudPopupHtml(s) {
     return `
-<div id="sh-app" class="${s.privacyOfficeMode ? 'sh-privacy' : ''}">
+<div id="sh-app" class="sh-popup-compact ${s.privacyOfficeMode ? 'sh-privacy' : ''}">
   
-  <div id="safe-hud-display" class="sh-hud" style="width:${s.hudWidth}px;margin:14px 16px 20px;">
+  <div id="safe-hud-display" class="sh-hud" style="width:${s.hudWidth}px;margin:0;">
     <div class="sh-hud-inner">
       <div class="sh-hud-wallet-wrap">
         <div id="safe-hud-wallet" class="sh-hud-wallet">-</div>
@@ -1072,6 +1381,126 @@
     </div>
   </div>
 </div>`;
+  }
+
+  function createInlineHud() {
+    document.getElementById('safe-hud-inline-wrap')?.remove();
+    loadSettingsIntoSettings();
+    injectMainChromeStyles(document);
+
+    const wrap = document.createElement('div');
+    wrap.id = 'safe-hud-inline-wrap';
+    wrap.style.cssText = [
+      'position:fixed',
+      `left:${Number.isFinite(settings.hudLeft) ? settings.hudLeft : 16}px`,
+      `top:${Number.isFinite(settings.hudTop) ? settings.hudTop : 16}px`,
+      'z-index:2147483644',
+      'max-width:calc(100vw - 24px)',
+      'max-height:calc(100vh - 24px)',
+      'overflow:auto',
+      'resize:both',
+      'font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
+    ].join(';');
+    wrap.innerHTML = `
+      <div id="safe-hud-inline-handle" style="height:30px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 10px;background:#182232;color:#dce5f4;border:1px solid #29364b;border-bottom:0;border-radius:12px 12px 0 0;cursor:move;font-size:12px;font-weight:700;user-select:none;">
+        <span>Canlı HUD</span>
+        <button type="button" id="safe-hud-inline-close" title="HUD'u gizle" style="border:0;background:#26354c;color:#fff;border-radius:7px;width:24px;height:22px;cursor:pointer;">×</button>
+      </div>
+      <div id="safe-hud-inline-root">${buildHudPopupHtml(settings)}</div>
+    `;
+    document.body.appendChild(wrap);
+    state.inlineHudEl = wrap;
+
+    const closeBtn = wrap.querySelector('#safe-hud-inline-close');
+    if (closeBtn) closeBtn.onclick = () => wrap.remove();
+
+    const handle = wrap.querySelector('#safe-hud-inline-handle');
+    if (handle) {
+      let drag = null;
+      handle.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        drag = { x: e.clientX, y: e.clientY, left: wrap.offsetLeft, top: wrap.offsetTop };
+        handle.setPointerCapture(e.pointerId);
+      });
+      handle.addEventListener('pointermove', (e) => {
+        if (!drag) return;
+        const left = Math.max(0, Math.min(window.innerWidth - 80, drag.left + e.clientX - drag.x));
+        const top = Math.max(0, Math.min(window.innerHeight - 60, drag.top + e.clientY - drag.y));
+        wrap.style.left = `${left}px`;
+        wrap.style.top = `${top}px`;
+      });
+      handle.addEventListener('pointerup', () => {
+        if (!drag) return;
+        const st = readStoredSettings();
+        st.hudLeft = parseInt(wrap.style.left, 10) || 16;
+        st.hudTop = parseInt(wrap.style.top, 10) || 16;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        drag = null;
+      });
+    }
+  }
+
+  function readStoredSettings() {
+    try {
+      return { ...defaults, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') };
+    } catch {
+      return { ...defaults };
+    }
+  }
+
+  function applyInlineHudUpdate(payload) {
+    if ((settings.hudSurface || 'popup') !== 'inline') return;
+    if (!document.getElementById('safe-hud-inline-wrap')) createInlineHud();
+    const s = readStoredSettings();
+    const privacy = !!s.privacyOfficeMode;
+    const walletEl = document.getElementById('safe-hud-wallet');
+    const positionsEl = document.getElementById('safe-hud-positions');
+    const statusEl = document.getElementById('safe-hud-status');
+    const hudBox = document.getElementById('safe-hud-display');
+    document.getElementById('sh-app')?.classList.toggle('sh-privacy', privacy);
+    if (hudBox) {
+      hudBox.style.width = `${s.hudWidth}px`;
+      hudBox.style.margin = '0';
+    }
+    if (walletEl) {
+      walletEl.textContent = formatHudWalletDisplay(payload.wallet);
+      walletEl.style.fontSize = `${s.hudWalletFontSize}px`;
+      walletEl.className = `sh-hud-wallet ${privacy ? 'sh-tone-office' : 'sh-tone-neu'}`;
+    }
+    if (positionsEl) {
+      positionsEl.style.gap = `${s.hudGap}px`;
+      positionsEl.innerHTML = '';
+      const rows = sortPositionsByPnlPreference(payload.positions || [], s.hudPnlSort || 'none');
+      rows.forEach((pos, idx) => {
+        const row = document.createElement('div');
+        row.className = 'sh-row';
+        const pnlNum = parseNumber(String(pos.pnl));
+        const left = document.createElement('div');
+        left.textContent = privacy && s.maskRowLabels ? `Kalem ${idx + 1}` : pos.coin || '-';
+        left.className = `sh-row-coin ${privacy ? 'sh-tone-office' : pnlNum > 0 ? 'sh-tone-up' : pnlNum < 0 ? 'sh-tone-down' : 'sh-tone-neu'}`;
+        left.style.fontSize = `${s.hudCoinFontSize}px`;
+        const rightWrap = document.createElement('div');
+        rightWrap.className = 'sh-row-right';
+        const pnl = document.createElement('div');
+        const tone = privacy ? (pnlNum > 0 ? 'sh-tone-office-pos' : pnlNum < 0 ? 'sh-tone-office-neg' : 'sh-tone-office') : pnlNum > 0 ? 'sh-tone-up' : pnlNum < 0 ? 'sh-tone-down' : 'sh-tone-neu';
+        pnl.textContent = formatHudStripSignChars(pos.pnl);
+        pnl.className = `sh-row-pnl ${tone}`;
+        pnl.style.fontSize = `${s.hudPnlFontSize}px`;
+        rightWrap.appendChild(pnl);
+        const pctShown = formatHudStripSignChars(pos.pct);
+        if (pctShown) {
+          const pct = document.createElement('div');
+          pct.textContent = pctShown;
+          pct.className = `sh-row-pct ${tone}`;
+          pct.style.fontSize = `${s.hudPctFontSize}px`;
+          rightWrap.appendChild(pct);
+        }
+        row.appendChild(left);
+        row.appendChild(rightWrap);
+        positionsEl.appendChild(row);
+      });
+    }
+    if (statusEl) statusEl.textContent = privacy ? '' : payload.debug || '';
   }
 
   /**
@@ -1092,6 +1521,10 @@
    */
   function postSoundToHudWindow(playMsg) {
     try {
+      if ((settings.hudSurface || 'popup') === 'inline') {
+        playLocalSound(playMsg);
+        return;
+      }
       const w = state.hudWindow;
       if (!w || w.closed) {
         showSafeHudLauncherToast('Önce HUD penceresini açın; ses orada çalar.');
@@ -1101,6 +1534,116 @@
     } catch (e2) {
       showSafeHudLauncherToast('HUD penceresine mesaj gönderilemedi.');
     }
+  }
+
+  const localAudioState = {
+    ctx: null,
+    severeStopHandles: [],
+    severeCooldownUntil: 0,
+  };
+
+  function getLocalAudioCtx() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    if (!localAudioState.ctx) localAudioState.ctx = new AC();
+    return localAudioState.ctx;
+  }
+
+  function stopLocalSevereVoicesNow() {
+    localAudioState.severeStopHandles.forEach((fn) => {
+      try {
+        fn();
+      } catch (e) {}
+    });
+    localAudioState.severeStopHandles = [];
+  }
+
+  function playLocalSound(msg = {}) {
+    const ctx = getLocalAudioCtx();
+    if (!ctx) return;
+    try {
+      if (ctx.state === 'suspended') ctx.resume();
+    } catch (e) {}
+    const s = { ...defaults, ...settings };
+    const volOverride = Number(msg.volumeOverride);
+    const volume = Number.isFinite(volOverride) ? Math.max(0.0001, Math.min(1, volOverride)) : null;
+    const start = ctx.currentTime;
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.setValueAtTime(msg.sound === 'severe' ? -8 : -18, start);
+    comp.ratio.setValueAtTime(msg.sound === 'severe' ? 18 : 8, start);
+    comp.attack.setValueAtTime(0.003, start);
+    comp.release.setValueAtTime(0.22, start);
+    comp.connect(ctx.destination);
+
+    if (msg.sound === 'happy') {
+      const vol = volume ?? Math.max(0.0001, Math.min(1, Number(s.happyVolume) || Number(s.smallAlarmVolume) || 0.06));
+      [520, 780, 1120].forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        const t = start + i * 0.055;
+        osc.type = i === 2 ? 'triangle' : 'sine';
+        osc.frequency.setValueAtTime(freq, t);
+        osc.frequency.exponentialRampToValueAtTime(freq * 1.28, t + 0.16);
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(Math.min(0.45, vol * 2.1), t + 0.025);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+        osc.connect(g);
+        g.connect(comp);
+        osc.start(t);
+        osc.stop(t + 0.25);
+      });
+      setTimeout(() => {
+        try {
+          comp.disconnect();
+        } catch (e) {}
+      }, 420);
+      return;
+    }
+
+    const now = performance.now();
+    if (!msg.force && localAudioState.severeCooldownUntil > now) {
+      try {
+        comp.disconnect();
+      } catch (e) {}
+      return;
+    }
+    stopLocalSevereVoicesNow();
+    const tier = msg.tier === 'sub3000' ? 'sub3000' : msg.tier === 'critical' ? 'critical' : 'simple';
+    const vol = volume ?? Math.max(0.0001, Math.min(1, Number(s.severeVolume) || Number(s.bigAlarmVolume) || 0.08));
+    const intM = Math.min(2.8, Math.max(0.55, Number(msg.intensityMul) || (tier === 'simple' ? 0.8 : 1.4)));
+    const durM = Math.min(2.4, Math.max(0.65, Number(msg.durationMul) || 1));
+    const count = tier === 'sub3000' ? Math.round(110 * durM) : tier === 'critical' ? Math.round(58 * durM) : Math.round(16 * durM);
+    const step = tier === 'sub3000' ? 0.085 : tier === 'critical' ? 0.12 : 0.13;
+    const pulseLen = tier === 'simple' ? 0.28 : tier === 'critical' ? 0.78 : 0.92;
+    for (let i = 0; i < count; i++) {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      const t = start + i * step;
+      osc.type = tier === 'simple' ? (i % 2 ? 'triangle' : 'square') : i % 2 ? 'sawtooth' : 'square';
+      osc.frequency.setValueAtTime(tier === 'simple' ? (i % 2 ? 900 : 1500) : i % 2 ? 260 + (i % 9) * 38 : 620 + (i % 7) * 52, t);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(Math.min(1.35, vol * intM * (tier === 'sub3000' ? 1.28 : 1)), t + 0.018);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + (tier === 'simple' ? 0.22 : 0.68));
+      osc.connect(g);
+      g.connect(comp);
+      osc.start(t);
+      osc.stop(t + pulseLen);
+      localAudioState.severeStopHandles.push(() => {
+        try {
+          osc.stop(0);
+        } catch (e) {}
+        try {
+          osc.disconnect();
+          g.disconnect();
+        } catch (e2) {}
+      });
+    }
+    localAudioState.severeStopHandles.push(() => {
+      try {
+        comp.disconnect();
+      } catch (e) {}
+    });
+    localAudioState.severeCooldownUntil = now + (tier === 'sub3000' ? 45000 : tier === 'critical' ? 18000 : 2500);
   }
 
   /**
@@ -1120,7 +1663,7 @@
       'right:12px',
       'bottom:58px',
       'z-index:2147483645',
-      'max-width:min(520px,calc(100vw - 24px))',
+      'max-width:min(560px,calc(100vw - 24px))',
       'max-height:min(72vh,calc(100vh - 120px))',
       'display:flex',
       'flex-direction:column',
@@ -1133,7 +1676,7 @@
       <div class="sh-card" style="margin:0;display:flex;flex-direction:column;max-height:100%;overflow:hidden;">
         <div class="sh-card-h" style="flex-shrink:0;">
           <strong>HUD ayarları</strong>
-          <button type="button" id="safe-main-panel-toggle" class="sh-btn sh-btn-quiet" style="padding:6px 12px;">${collapsed ? 'Aç' : 'Daralt'}</button>
+          <button type="button" id="safe-main-panel-toggle" class="sh-btn sh-btn-primary" style="padding:6px 12px;">${collapsed ? 'Ayarları aç' : 'Daralt'}</button>
         </div>
         <div id="safe-main-settings-body" class="sh-card-body" style="overflow-y:auto;flex:1;min-height:0;display:${collapsed ? 'none' : 'block'};">
           ${buildMainSettingsFormHtml(s)}
@@ -1162,7 +1705,7 @@
       localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
       const nowCollapsed = st.panelCollapsed;
       bodyEl.style.display = nowCollapsed ? 'none' : 'block';
-      toggleBtn.textContent = nowCollapsed ? 'Aç' : 'Daralt';
+      toggleBtn.textContent = nowCollapsed ? 'Ayarları aç' : 'Daralt';
       notifyHudSettingsChanged();
     };
 
@@ -1179,6 +1722,76 @@
     bindCheckMain('safe-hide-originals', 'hideOriginals');
     bindCheckMain('safe-severe-enabled', 'severeEnabled');
     bindCheckMain('safe-happy-enabled', 'happyEnabled');
+    bindCheckMain('safe-small-up-enabled', 'smallUpEnabled');
+    bindCheckMain('safe-small-down-enabled', 'smallDownEnabled');
+    bindCheckMain('safe-big-up-enabled', 'bigUpEnabled');
+    bindCheckMain('safe-big-down-enabled', 'bigDownEnabled');
+    bindCheckMain('safe-critical-drop-enabled', 'criticalDropEnabled');
+
+    const updateAlarmSummary = () => {
+      const st = readMainPanelSettings();
+      const el = document.getElementById('safe-alarm-summary');
+      if (!el) return;
+      const mode = st.alarmEngineMode === 'legacy' ? 'Eski grid aktif.' : 'Sistematik mod aktif.';
+      const small = `Ufak: +${st.smallUpUsd || 25} / -${st.smallDownUsd || 25} USD`;
+      const big = `Büyük: +${st.bigUpUsd || 100} / -${st.bigDownUsd || 100} USD`;
+      const critical = `Kritik: son ${Math.round((st.criticalRollingWindowMs || 60000) / 1000)} sn içinde -${st.criticalDropUsd || 180} USD`;
+      el.textContent = `${mode} ${small}. ${big}. ${critical}. Aynı eşik, fiyat ${st.rearmOffset || 5} USD geri toparlanmadan tekrar çalmaz.`;
+    };
+
+    const bindAlarmNumberMain = (id, key) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const commit = () => {
+        const st = readMainPanelSettings();
+        const n = parseFloat(el.value);
+        st[key] = Number.isFinite(n) ? Math.max(1, n) : defaults[key];
+        el.value = String(st[key]);
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        state.movementLatchedLevels.clear();
+        state.criticalDropLatched = false;
+        updateAlarmSummary();
+        notifyHudSettingsChanged();
+      };
+      el.addEventListener('change', commit);
+      el.addEventListener('blur', commit);
+    };
+    bindAlarmNumberMain('safe-small-up-usd', 'smallUpUsd');
+    bindAlarmNumberMain('safe-small-down-usd', 'smallDownUsd');
+    bindAlarmNumberMain('safe-big-up-usd', 'bigUpUsd');
+    bindAlarmNumberMain('safe-big-down-usd', 'bigDownUsd');
+    bindAlarmNumberMain('safe-critical-drop-usd', 'criticalDropUsd');
+
+    const alarmModeEl = document.getElementById('safe-alarm-engine-mode');
+    if (alarmModeEl) {
+      alarmModeEl.onchange = () => {
+        const st = readMainPanelSettings();
+        st.alarmEngineMode = alarmModeEl.value;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        state.movementLatchedLevels.clear();
+        state.alarmCooldownUntil = {};
+        state.criticalDropLatched = false;
+        updateAlarmSummary();
+        notifyHudSettingsChanged();
+      };
+    }
+
+    const hudSurfaceEl = document.getElementById('safe-hud-surface');
+    if (hudSurfaceEl) {
+      hudSurfaceEl.onchange = () => {
+        const st = readMainPanelSettings();
+        st.hudSurface = hudSurfaceEl.value;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        loadSettingsIntoSettings();
+        if (st.hudSurface === 'inline') {
+          createInlineHud();
+          tick();
+        } else {
+          document.getElementById('safe-hud-inline-wrap')?.remove();
+        }
+        notifyHudSettingsChanged();
+      };
+    }
 
     const poEl = document.getElementById('safe-privacy-office');
     if (poEl) {
@@ -1243,6 +1856,35 @@
       localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
       notifyHudSettingsChanged();
     };
+    const bindFloatRangeMain = (id, key, digits = 2) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.oninput = (e) => {
+        const st = readMainPanelSettings();
+        st[key] = parseFloat(e.target.value);
+        const val = document.getElementById(`${id}-val`);
+        if (val) val.textContent = st[key].toFixed(digits);
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        notifyHudSettingsChanged();
+      };
+    };
+    bindFloatRangeMain('safe-small-alarm-volume', 'smallAlarmVolume');
+    bindFloatRangeMain('safe-big-alarm-volume', 'bigAlarmVolume');
+    bindFloatRangeMain('safe-critical-alarm-volume', 'criticalAlarmVolume');
+
+    const criticalWindowEl = document.getElementById('safe-critical-window');
+    if (criticalWindowEl) {
+      criticalWindowEl.oninput = (e) => {
+        const st = readMainPanelSettings();
+        const sec = parseInt(e.target.value, 10);
+        st.criticalRollingWindowMs = Math.max(5, sec) * 1000;
+        document.getElementById('safe-critical-window-val').textContent = String(Math.max(5, sec));
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        state.criticalDropLatched = false;
+        updateAlarmSummary();
+        notifyHudSettingsChanged();
+      };
+    }
     document.getElementById('safe-happy-buffer').oninput = (e) => {
       const st = readMainPanelSettings();
       st.happyUpBufferUsd = parseInt(e.target.value, 10);
@@ -1291,6 +1933,7 @@
       try {
         if (window.safeHudRearmFromSevereSlider) window.safeHudRearmFromSevereSlider();
       } catch (err2) {}
+      updateAlarmSummary();
       notifyHudSettingsChanged();
     };
 
@@ -1393,6 +2036,17 @@
         durationMul: 2.05,
       });
     };
+    [
+      'safe-small-up-enabled',
+      'safe-small-down-enabled',
+      'safe-big-up-enabled',
+      'safe-big-down-enabled',
+      'safe-critical-drop-enabled',
+    ].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('change', updateAlarmSummary);
+    });
+    updateAlarmSummary();
   }
 
   /**
@@ -1486,7 +2140,10 @@
             ? 'simple'
             : 'critical';
 
-      const baseVol = opts.useHappyVolume
+      const overrideVol = Number(opts.volumeOverride);
+      const baseVol = Number.isFinite(overrideVol)
+        ? Math.max(0.0001, Math.min(1, overrideVol))
+        : opts.useHappyVolume
         ? Math.max(0.0001, Math.min(1, Number(s.happyVolume) || 0.06))
         : Math.max(0.0001, Math.min(1, Number(s.severeVolume) || 0.06));
 
@@ -1619,7 +2276,10 @@
       const ctx = getAudioCtx();
       if (!ctx) return;
 
-      const vol = Math.max(0.0001, Math.min(1, Number(s.happyVolume) || 0.06));
+      const overrideVol = Number(opts.volumeOverride);
+      const vol = Number.isFinite(overrideVol)
+        ? Math.max(0.0001, Math.min(1, overrideVol))
+        : Math.max(0.0001, Math.min(1, Number(s.happyVolume) || 0.06));
       const start = ctx.currentTime;
       const comp = compressor(ctx, -18, 8);
       const master = ctx.createGain();
@@ -1707,6 +2367,7 @@
       if (mainLbl) {
         mainLbl.textContent = privacy ? 'Özet' : 'Canlı özet';
       }
+      d.getElementById('sh-app')?.classList.add('sh-popup-compact');
 
       const walletEl = d.getElementById('safe-hud-wallet');
       const positionsEl = d.getElementById('safe-hud-positions');
@@ -1805,12 +2466,13 @@
               force: !!ev.data.force,
               intensityMul: ev.data.intensityMul,
               durationMul: ev.data.durationMul,
+              volumeOverride: ev.data.volumeOverride,
               quickRepeatCooldown: !!ev.data.quickRepeatCooldown,
               tier: ev.data.tier,
             });
           }
           if (ev.data.sound === 'happy') {
-            playHappy(s, { force: !!ev.data.force });
+            playHappy(s, { force: !!ev.data.force, volumeOverride: ev.data.volumeOverride });
           }
         });
       }
@@ -1863,7 +2525,7 @@
     const d = w.document;
     d.open();
     d.write(
-      `<!DOCTYPE html><html lang="tr"><head><meta charset="utf-8"><title>Çalışma özeti</title></head><body style="margin:0;background:#0f1419;color:#e8eaed;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;"><div id="safe-popup-root"></div></body></html>`,
+      `<!DOCTYPE html><html lang="tr"><head><meta charset="utf-8"><title>Çalışma özeti</title></head><body style="margin:0;padding:0;background:#080d12;color:#e8eaed;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;overflow:auto;"><div id="safe-popup-root"></div></body></html>`,
     );
     d.close();
 
@@ -2006,18 +2668,28 @@
 
   function createLauncherOnPage() {
     document.getElementById('safe-hud-launcher-host')?.remove();
+    loadSettingsIntoSettings();
     const host = document.createElement('div');
     host.id = 'safe-hud-launcher-host';
     host.style.cssText =
       'position:fixed;left:12px;bottom:12px;z-index:2147483646;font-family:Arial,sans-serif;display:flex;gap:8px;flex-wrap:wrap;align-items:center;';
     host.innerHTML = `
-      <button type="button" id="safe-hud-open-win" style="background:#1a5f8a;color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.35);">HUD penceresini aç</button>
+      <button type="button" id="safe-hud-open-win" style="background:#1a5f8a;color:#fff;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.35);">${(settings.hudSurface || 'popup') === 'inline' ? 'HUD divini aç' : 'HUD penceresini aç'}</button>
       <button type="button" id="safe-hud-close-all" style="background:#333;color:#fff;border:0;border-radius:10px;padding:10px 12px;cursor:pointer;">Kapat</button>
     `;
     document.body.appendChild(host);
-    bindUserGestureOpen(document.getElementById('safe-hud-open-win'));
+    const openBtn = document.getElementById('safe-hud-open-win');
+    if ((settings.hudSurface || 'popup') === 'inline') {
+      openBtn.onclick = () => {
+        createInlineHud();
+        tick();
+      };
+    } else {
+      bindUserGestureOpen(openBtn);
+    }
     document.getElementById('safe-hud-close-all').onclick = () => window.safeHudCleanup();
     createMainSettingsPanel();
+    if ((settings.hudSurface || 'popup') === 'inline') createInlineHud();
   }
 
   /**
@@ -2061,12 +2733,12 @@
     } else {
       updateArmedLevels(currentPrice);
       bumpConsecutiveDownStreak(state.lastWalletPrice, currentPrice);
-      checkSevereCrossings(state.lastWalletPrice, currentPrice);
-      checkHappy50Up(state.lastWalletPrice, currentPrice);
+      checkSystematicMovementAlarms(state.lastWalletPrice, currentPrice);
       state.lastWalletPrice = currentPrice;
     }
 
     recordPriceSample(currentPrice);
+    checkCriticalRollingDrop(currentPrice);
     checkWalletFlatStale(currentPrice);
 
     const sounds = [...state.pendingSounds];
@@ -2082,12 +2754,13 @@
         typeof item === 'string'
           ? { type: MSG.PLAY, sound: item }
           : item.sound === 'happy'
-            ? { type: MSG.PLAY, sound: 'happy', force: !!item.force }
+            ? { type: MSG.PLAY, sound: 'happy', force: !!item.force, volumeOverride: item.volumeOverride }
             : {
                 type: MSG.PLAY,
                 sound: 'severe',
                 intensityMul: item.intensityMul,
                 durationMul: item.durationMul,
+                volumeOverride: item.volumeOverride,
                 skipRecoveryStopWindow: item.skipRecoveryStopWindow,
                 quickRepeatCooldown: item.quickRepeatCooldown,
                 tier: item.tier,
@@ -2126,12 +2799,13 @@
             typeof item === 'string'
               ? { type: MSG.PLAY, sound: item }
               : item.sound === 'happy'
-                ? { type: MSG.PLAY, sound: 'happy', force: !!item.force }
+                ? { type: MSG.PLAY, sound: 'happy', force: !!item.force, volumeOverride: item.volumeOverride }
                 : {
                     type: MSG.PLAY,
                     sound: 'severe',
                     intensityMul: item.intensityMul,
                     durationMul: item.durationMul,
+                    volumeOverride: item.volumeOverride,
                     skipRecoveryStopWindow: item.skipRecoveryStopWindow,
                     quickRepeatCooldown: item.quickRepeatCooldown,
                     tier: item.tier,
@@ -2164,6 +2838,9 @@
     state.priceHistory.length = 0;
     state.happyLatchedThresholds.clear();
     state.severeAwaitDepth.clear();
+    state.movementLatchedLevels.clear();
+    state.alarmCooldownUntil = {};
+    state.criticalDropLatched = false;
     state.consecutiveDownStreak = 0;
     state.lastHappyGlobalAt = 0;
     state.criticalVoiceUntil = 0;
@@ -2188,6 +2865,8 @@
       state.timer = null;
     }
     document.getElementById('safe-hud-launcher-host')?.remove();
+    document.getElementById('safe-hud-inline-wrap')?.remove();
+    stopLocalSevereVoicesNow();
     try {
       document.getElementById('safe-hud-main-settings-wrap')?.remove();
     } catch (eRm) {}
