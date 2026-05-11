@@ -20,11 +20,6 @@
   /** Bu düşüşte tam “güçlü” ölçek kabul edilir (üstü daha da artar, tavan kodda) */
   const SEVERE_DROP_REF_USD = 200;
 
-  /** 100 USD katları (2500, 2400…) — kritik alarm (uzun / güçlü) */
-  const DROP_CRITICAL_GRID_USD = 100;
-  /** 50 USD katları (2650, 2750…) — basit alarm; 100’lükler kritiğe düşer */
-  const DROP_SIMPLE_GRID_USD = 50;
-
   /**
    * @description Nuxt risk header içindeki cüzdan tutarı (.value).
    * `.ready` yoksa yedek seçici denenir. `settings.walletSelector` doluysa önce o kullanılır.
@@ -55,9 +50,6 @@
     hudWidth: 220,
     hudGap: 2,
 
-    severeEnabled: true,
-    happyEnabled: true,
-    alarmEngineMode: 'systematic',
     smallUpEnabled: true,
     smallDownEnabled: true,
     bigUpEnabled: true,
@@ -76,21 +68,7 @@
     criticalAlarmCooldownMs: 45000,
     criticalRollingWindowMs: 60000,
     hudSurface: 'popup',
-    /** @description 50’lik banda girince değil, band + bu USD (ör. 1500 → 1505+) ile yükseliş sesi */
-    happyUpBufferUsd: 5,
-    severeVolume: 0.06,
-    happyVolume: 0.06,
-    severeStart: 3000,
-    severeStep: 50,
     rearmOffset: 5,
-    /** @description Eşiğin altına bu kadar USD (örn. 3300 → 3290) inmeden düşüş alarmı tetiklenmez */
-    dropConfirmUsd: 10,
-    /** @description Ardışık düşen poll sayısı (1 = tek tick’te yeterli derinlik yeter) */
-    minConsecutiveDown: 1,
-    /** @description Yükseliş sesleri arası minimum süre (ms) */
-    happyCooldownMs: 12000,
-    /** @description Bu USD ve altı ızgara kademelerinde ekstra uzun/keskin alarm (varsayılan 3000) */
-    subprimeAlarmBelowUsd: 3000,
 
     panelCollapsed: false,
     hudLeft: 16,
@@ -114,20 +92,30 @@
 
   const settings = { ...defaults };
 
+  function normalizeSettings(raw = {}) {
+    const clean = { ...defaults };
+    Object.keys(defaults).forEach((key) => {
+      if (Object.prototype.hasOwnProperty.call(raw, key)) clean[key] = raw[key];
+    });
+    return clean;
+  }
+
   function loadSettingsIntoSettings() {
     try {
-      Object.assign(settings, defaults, JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'));
+      Object.assign(settings, normalizeSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}')));
     } catch {
       Object.assign(settings, defaults);
     }
   }
 
   loadSettingsIntoSettings();
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  } catch (e) {}
 
   const state = {
     timer: null,
     lastWalletPrice: null,
-    armedLevels: new Set(),
     hudWindow: null,
     /** @description true iken veri döngüsü popup penceresinde çalışır (ana sekme arka planda kısılsa bile). */
     popupPollsOpener: false,
@@ -137,14 +125,6 @@
     severePlaybackUntil: 0,
     /** @description { t: epochMs, p: number } — son ~1 dk+ cüzdan örnekleri */
     priceHistory: [],
-    /** @description Tampon eşiği (örn. 1505) için ses çalındı; fiyat eşiğin altına inene kadar tekrar yok */
-    happyLatchedThresholds: new Set(),
-    /** @description Kırmızı eşik geçildi ama henüz onay derinliğine inilmedi (L seviyesi USD) */
-    severeAwaitDepth: new Set(),
-    /** @description Son tick’e göre ardışık “fiyat düştü” poll sayısı (düz / yukarı sıfırlar) */
-    consecutiveDownStreak: 0,
-    /** @description performance.now() — yükseliş sesi global soğuma */
-    lastHappyGlobalAt: 0,
     /** @description 100 USD kritik alarm bitene kadar fiyat yukarı gelse bile STOP gönderilmez */
     criticalVoiceUntil: 0,
     /** @description Durgunluk alarmı: son görülen cüzdan USD (aynı kaldı mı diye) */
@@ -161,10 +141,6 @@
     criticalDropLatched: false,
     inlineHudEl: null,
   };
-
-  function save() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-  }
 
   function qs(sel) {
     if (!sel || !String(sel).trim()) return null;
@@ -416,7 +392,7 @@
   }
 
   /**
-   * @description `subprimeAlarmBelowUsd` altı kademe — kritikten daha uzun ve keskin (uyanma).
+   * @description Kritik düşüş için en uzun ve keskin alarm zamanlaması (uyanma profili).
    */
   function sub3000SevereSynthTiming(intensityMul, durationMul) {
     const intBase = Math.min(2.5, Math.max(0.5, Number(intensityMul) || 1));
@@ -438,12 +414,6 @@
       pulseDecayEnd: 0.86,
       totalMs: Math.min(180000, Math.ceil(totalSec * 1000)),
     };
-  }
-
-  function getSubprimeThresholdUsd() {
-    const v = Number(settings.subprimeAlarmBelowUsd);
-    if (!Number.isFinite(v)) return 3000;
-    return Math.min(20000, Math.max(100, Math.round(v)));
   }
 
   function recordPriceSample(price) {
@@ -488,16 +458,17 @@
       price: currentPrice,
       staleMs: now - state.walletFlatAnchorAt,
     });
-    if (settings.severeEnabled) {
+    if (settings.smallDownEnabled || settings.bigDownEnabled || settings.criticalDropEnabled) {
       emitPlaySound('severe', {
         tier: 'simple',
         quickRepeatCooldown: true,
         skipRecoveryStopWindow: true,
         intensityMul: 1,
         durationMul: 0.95,
+        volumeOverride: alarmVolumeFor('small'),
       });
-    } else if (settings.happyEnabled) {
-      const play = { type: MSG.PLAY, sound: 'happy', force: true };
+    } else if (settings.smallUpEnabled || settings.bigUpEnabled) {
+      const play = { type: MSG.PLAY, sound: 'happy', force: true, volumeOverride: alarmVolumeFor('small') };
       if (state.popupPollsOpener) state.pendingSounds.push(play);
       else if ((settings.hudSurface || 'popup') === 'inline') playLocalSound(play);
       else postToPopup(play);
@@ -578,85 +549,6 @@
     } catch (e) {}
   }
 
-  /** @description `severeStep` için güvenli pozitif tam sayı adım. */
-  function getSevereStep() {
-    const s = Math.round(Number(settings.severeStep) || 50);
-    return Math.max(1, s);
-  }
-
-  /**
-   * @description Tarama üst sınırı (adımın katı). Tarama `severeStart` ve fiyatın üstünden başlar; alarm yalnızca L ≤ severeStart 100’lüklerde.
-   * @param priceCandidates - Örn. anlık cüzdan veya prev+current
-   */
-  function getSevereGridTopAligned(...priceCandidates) {
-    const step = getSevereStep();
-    const nums = priceCandidates.filter((p) => p != null && Number.isFinite(p));
-    const rawTop = nums.length ? Math.max(settings.severeStart, ...nums) : settings.severeStart;
-    return Math.ceil(rawTop / step) * step;
-  }
-
-  /**
-   * @description Düşüş eşiği 100 USD katı mı (kritik), yoksa 50’lik basit mi.
-   * @param level - Eşik USD (örn. 2650, 2500)
-   */
-  function severeDropTierForLevel(level) {
-    const L = Math.round(Number(level));
-    if (!Number.isFinite(L)) return 'simple';
-    if (L % DROP_CRITICAL_GRID_USD === 0) return 'critical';
-    if (L % DROP_SIMPLE_GRID_USD === 0) return 'simple';
-    return 'simple';
-  }
-
-  function getSevereStartCapUsd() {
-    const v = Math.round(Number(settings.severeStart));
-    return Number.isFinite(v) ? Math.min(200000, Math.max(0, v)) : 3000;
-  }
-
-  /**
-   * @description 100 USD katı ve `severeStart` tavanı altında (üst kademe alarmı yok, örn. 3200/3100 atlanır).
-   */
-  function isSevereHundredAlarmLevel(level) {
-    const L = Math.round(Number(level));
-    if (!Number.isFinite(L) || L % DROP_CRITICAL_GRID_USD !== 0) return false;
-    return L <= getSevereStartCapUsd();
-  }
-
-  function updateArmedLevels(price) {
-    if (price == null) return;
-    const cap = getSevereStartCapUsd();
-    for (const lv of [...state.armedLevels]) {
-      if (lv > cap || Math.round(Number(lv)) % DROP_CRITICAL_GRID_USD !== 0) state.armedLevels.delete(lv);
-    }
-    const step = getSevereStep();
-    const rearRaw = Number(settings.rearmOffset);
-    const rear = Number.isFinite(rearRaw) ? Math.max(0, Math.min(200, rearRaw)) : 5;
-    const top = getSevereGridTopAligned(price);
-    for (let level = top; level >= 0; level -= step) {
-      if (!isSevereHundredAlarmLevel(level)) continue;
-      if (price >= level + rear) {
-        state.armedLevels.add(level);
-      }
-    }
-  }
-
-  function getDropConfirmUsd() {
-    const v = Number(settings.dropConfirmUsd);
-    if (!Number.isFinite(v) || v < 0) return 10;
-    return Math.min(250, v);
-  }
-
-  function getMinConsecutiveDown() {
-    const v = parseInt(String(settings.minConsecutiveDown), 10);
-    if (!Number.isFinite(v)) return 1;
-    return Math.max(1, Math.min(8, v));
-  }
-
-  function bumpConsecutiveDownStreak(prevPrice, currentPrice) {
-    if (prevPrice == null || currentPrice == null) return;
-    if (currentPrice < prevPrice) state.consecutiveDownStreak += 1;
-    else if (currentPrice > prevPrice) state.consecutiveDownStreak = 0;
-  }
-
   /**
    * @description Alarm tetik nedenini tek yerde standart loglar.
    */
@@ -664,147 +556,6 @@
     try {
       console.log(`[SAFE_HUD][ALARM][${tag}]`, detail);
     } catch (e) {}
-  }
-
-  function checkSevereCrossings(prevPrice, currentPrice) {
-    if (!settings.severeEnabled) return;
-    if (prevPrice == null || currentPrice == null) return;
-
-    const dropConfirm = getDropConfirmUsd();
-    const minDown = getMinConsecutiveDown();
-    const step = getSevereStep();
-    const top = getSevereGridTopAligned(prevPrice, currentPrice);
-
-    for (const L of [...state.severeAwaitDepth]) {
-      if (currentPrice > L) state.severeAwaitDepth.delete(L);
-      else if (!isSevereHundredAlarmLevel(L)) state.severeAwaitDepth.delete(L);
-    }
-
-    const downTick = currentPrice < prevPrice;
-    const strongDownMove = downTick && Number.isFinite(prevPrice) && prevPrice - currentPrice >= dropConfirm;
-    const streakOk = state.consecutiveDownStreak >= minDown || (minDown > 1 && strongDownMove);
-    const confirmed = [];
-
-    if (downTick) {
-      for (let level = top; level >= 0; level -= step) {
-        if (!isSevereHundredAlarmLevel(level)) continue;
-        if (!state.armedLevels.has(level)) continue;
-        const crossed = prevPrice > level && currentPrice <= level;
-        if (!crossed) continue;
-        const deep = currentPrice <= level - dropConfirm;
-        if (deep && streakOk) {
-          confirmed.push(level);
-          state.severeAwaitDepth.delete(level);
-        } else if (!deep) {
-          state.severeAwaitDepth.add(level);
-        }
-      }
-      for (const L of [...state.severeAwaitDepth]) {
-        if (!isSevereHundredAlarmLevel(L)) {
-          state.severeAwaitDepth.delete(L);
-          continue;
-        }
-        if (!state.armedLevels.has(L)) {
-          state.severeAwaitDepth.delete(L);
-          continue;
-        }
-        if (confirmed.includes(L)) continue;
-        const deep = currentPrice <= L - dropConfirm;
-        if (deep && streakOk) confirmed.push(L);
-      }
-    }
-
-    const uniq = [...new Set(confirmed)];
-    if (uniq.length === 0) return;
-
-    for (const level of uniq) {
-      state.armedLevels.delete(level);
-      state.severeAwaitDepth.delete(level);
-    }
-
-    /** Alt limit altı → sub3000; aksi 100 USD kritik (50’lik düşüşte alarm yok). */
-    const subT = getSubprimeThresholdUsd();
-    const tier = uniq.some((L) => L <= subT) ? 'sub3000' : 'critical';
-    const dropUsd = getDropUsdInRollingWindow(currentPrice, PRICE_ROLLING_WINDOW_MS);
-    const scale = computeSevereScalingFromDrop(dropUsd);
-    debugAlarmTrigger('DROP', {
-      at: new Date().toISOString(),
-      prevPrice,
-      currentPrice,
-      delta: Number((currentPrice - prevPrice).toFixed(3)),
-      severeStartCap: getSevereStartCapUsd(),
-      subprimeAlarmBelowUsd: subT,
-      dropConfirmUsd: dropConfirm,
-      minConsecutiveDown: minDown,
-      consecutiveDownStreak: state.consecutiveDownStreak,
-      crossedConfirmedLevels: uniq,
-      tier,
-      dropUsdInWindow: Number(dropUsd.toFixed(3)),
-      intensityMul: Number(scale.intensityMul.toFixed(3)),
-      durationMul: Number(scale.durationMul.toFixed(3)),
-      note: `100 USD levels only if L <= severeStart (${getSevereStartCapUsd()}). Fired: [${uniq.join(',')}].`,
-    });
-    emitPlaySound('severe', { ...scale, tier });
-  }
-
-  /**
-   * @description 50 USD’lik yükseliş bandında ses: yalnızca `band + tampon` üstüne çıkınca (ör. 1500 → en az 1505). Sınırı yalayarak tekrar çalmasın diye tampon eşiği latch’lenir.
-   * @param prevPrice - Bir önceki tick cüzdan USD
-   * @param currentPrice - Şimdiki tick
-   */
-  function checkHappy50Up(prevPrice, currentPrice) {
-    if (prevPrice == null || currentPrice == null) return;
-
-    const bufRaw = Number(settings.happyUpBufferUsd);
-    const buf = Number.isFinite(bufRaw) && bufRaw >= 0 ? Math.min(100, bufRaw) : 5;
-
-    for (const thr of [...state.happyLatchedThresholds]) {
-      if (currentPrice < thr) {
-        state.happyLatchedThresholds.delete(thr);
-      }
-    }
-
-    if (!settings.happyEnabled) return;
-    if (!settings.severeEnabled) return;
-
-    if (!(currentPrice > prevPrice)) return;
-
-    const prev50 = Math.floor(prevPrice / 50) * 50;
-    const curr50 = Math.floor(currentPrice / 50) * 50;
-
-    /** Büyük sıçramada onlarca “mutlu” üst üste binmesin; tick başına en fazla 3. */
-    let happyCount = 0;
-    const maxHappyPerTick = 3;
-
-    const tryEmitForThreshold = (threshold) => {
-      if (happyCount >= maxHappyPerTick) return;
-      if (state.happyLatchedThresholds.has(threshold)) return;
-      if (prevPrice < threshold && currentPrice >= threshold) {
-        const ms = Number(settings.happyCooldownMs);
-        const cd = Number.isFinite(ms) && ms >= 0 ? Math.min(120000, ms) : 12000;
-        const now = performance.now();
-        if (state.lastHappyGlobalAt > 0 && now - state.lastHappyGlobalAt < cd) return;
-        state.lastHappyGlobalAt = now;
-        const play = { type: MSG.PLAY, sound: 'happy', force: false };
-        if (state.popupPollsOpener) {
-          state.pendingSounds.push(play);
-        } else if ((settings.hudSurface || 'popup') === 'inline') {
-          playLocalSound(play);
-        } else {
-          postToPopup(play);
-        }
-        state.happyLatchedThresholds.add(threshold);
-        happyCount += 1;
-      }
-    };
-
-    if (curr50 > prev50) {
-      for (let level = prev50 + 50; level <= curr50; level += 50) {
-        tryEmitForThreshold(level + buf);
-      }
-    } else if (curr50 === prev50) {
-      tryEmitForThreshold(curr50 + buf);
-    }
   }
 
   function numSetting(key, fallback, min, max) {
@@ -950,11 +701,6 @@
   }
 
   function checkSystematicMovementAlarms(prevPrice, currentPrice) {
-    if (settings.alarmEngineMode !== 'systematic') {
-      checkSevereCrossings(prevPrice, currentPrice);
-      checkHappy50Up(prevPrice, currentPrice);
-      return;
-    }
     if (prevPrice == null || currentPrice == null || prevPrice === currentPrice) return;
     resetMovementLatchesAroundPrice(currentPrice);
     const dir = currentPrice > prevPrice ? 'up' : 'down';
@@ -972,7 +718,6 @@
   }
 
   function checkCriticalRollingDrop(currentPrice) {
-    if (settings.alarmEngineMode !== 'systematic') return;
     if (!settings.criticalDropEnabled) return;
     if (currentPrice == null || !Number.isFinite(currentPrice)) return;
     const windowMs = numSetting('criticalRollingWindowMs', 60000, 5000, 10 * 60 * 1000);
@@ -997,18 +742,6 @@
       { price: currentPrice, delta: -dropUsd, force: true },
     );
   }
-
-  /**
-   * @description Kritik eşik kaydırıldığında popup veya dışarıdan çağrılır.
-   */
-  window.safeHudRearmFromSevereSlider = () => {
-    state.armedLevels.clear();
-    state.severeAwaitDepth.clear();
-    const currentPrice = getWalletPrice();
-    if (currentPrice != null) {
-      updateArmedLevels(currentPrice);
-    }
-  };
 
   window.safeHudInvalidateDom = () => {
     /* Ayarlar / seçici değişince bir sonraki tick yeniden okur */
@@ -1191,10 +924,7 @@
     <div class="sh-section">
       <div class="sh-section-head">
         <strong class="sh-section-title">Alarm sistemi</strong>
-        <select id="safe-alarm-engine-mode" class="sh-select" style="max-width:190px;">
-          <option value="systematic" ${(s.alarmEngineMode || 'systematic') === 'systematic' ? 'selected' : ''}>Sistematik</option>
-          <option value="legacy" ${s.alarmEngineMode === 'legacy' ? 'selected' : ''}>Eski grid</option>
-        </select>
+        <span style="font-size:11px;color:var(--sh-muted);">Ufak / büyük / kritik</span>
       </div>
       <div class="sh-alarm-grid">
         <label>Ufak yükseliş</label>
@@ -1244,7 +974,6 @@
       </div>
     </div>
 
-    <p style="margin:0 0 8px;font-size:11px;color:var(--sh-muted);line-height:1.4;">Eski grid modu: düşüş alarmı yalnızca <strong>100 USD</strong> kademelerinde; alt limit ve altındaki 100’lüklerde ekstra uzun/keskin alarm çalar.</p>
     <div class="sh-test-actions">
       <button type="button" class="sh-btn sh-btn-good" id="safe-test-happy">Yükseliş testi</button>
       <button type="button" class="sh-btn sh-btn-quiet" id="safe-test-severe" title="50 USD kademesi — kısa / hafif">Basit düşüş</button>
@@ -1264,56 +993,10 @@
       <input id="safe-discreet-title" class="sh-inp" type="text" value="${dTitle}" placeholder="Çalışma özeti" style="grid-column:1/-1;margin-bottom:8px;">
       <label>Orijinalleri gizle</label>
       <input id="safe-hide-originals" type="checkbox" ${s.hideOriginals ? 'checked' : ''}>
-      <label>Düşüş ses motoru</label>
-      <input id="safe-severe-enabled" type="checkbox" ${s.severeEnabled ? 'checked' : ''}>
-      <label>Yükseliş ses motoru</label>
-      <input id="safe-happy-enabled" type="checkbox" ${s.happyEnabled ? 'checked' : ''}>
-      <label>Yükseliş tamponu (USD)</label>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <input id="safe-happy-buffer" type="range" min="0" max="25" step="1" value="${Number.isFinite(s.happyUpBufferUsd) ? s.happyUpBufferUsd : 5}">
-        <span id="safe-happy-buffer-val">${Number.isFinite(s.happyUpBufferUsd) ? s.happyUpBufferUsd : 5}</span>
-      </div>
-      <label>Düşüş onay derinliği (USD)</label>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <input id="safe-drop-confirm" type="range" min="0" max="80" step="1" value="${Number.isFinite(s.dropConfirmUsd) ? s.dropConfirmUsd : 10}">
-        <span id="safe-drop-confirm-val">${Number.isFinite(s.dropConfirmUsd) ? s.dropConfirmUsd : 10}</span>
-      </div>
-      <label>Ardışık düşüş tick</label>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <input id="safe-min-consecutive-down" type="range" min="1" max="5" step="1" value="${Number.isFinite(s.minConsecutiveDown) ? s.minConsecutiveDown : 1}">
-        <span id="safe-min-consecutive-down-val">${Number.isFinite(s.minConsecutiveDown) ? s.minConsecutiveDown : 1}</span>
-      </div>
-      <label>Yükseliş sesi soğuma (sn)</label>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <input id="safe-happy-cooldown" type="range" min="0" max="60" step="1" value="${Math.round((Number.isFinite(s.happyCooldownMs) ? s.happyCooldownMs : 12000) / 1000)}">
-        <span id="safe-happy-cooldown-val">${Math.round((Number.isFinite(s.happyCooldownMs) ? s.happyCooldownMs : 12000) / 1000)}</span>
-      </div>
-      <label>Izgara adımı (USD)</label>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <input id="safe-severe-step" type="range" min="25" max="100" step="25" value="${(() => {
-          const r = Math.round(Number(s.severeStep) || 50);
-          const q = Math.min(100, Math.max(25, Math.round(r / 25) * 25));
-          return q;
-        })()}">
-        <span id="safe-severe-step-val">${(() => {
-          const r = Math.round(Number(s.severeStep) || 50);
-          return Math.min(100, Math.max(25, Math.round(r / 25) * 25));
-        })()}</span>
-      </div>
       <label>Yeniden silah (USD üstü)</label>
       <div style="display:flex;align-items:center;gap:8px;">
         <input id="safe-rearm-offset" type="range" min="0" max="40" step="1" value="${Number.isFinite(s.rearmOffset) ? s.rearmOffset : 5}">
         <span id="safe-rearm-offset-val">${Number.isFinite(s.rearmOffset) ? s.rearmOffset : 5}</span>
-      </div>
-      <label>Ağır ses</label>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <input id="safe-severe-volume" type="range" min="0" max="1" step="0.01" value="${s.severeVolume}">
-        <span id="safe-severe-volume-val">${s.severeVolume.toFixed(2)}</span>
-      </div>
-      <label>Mutlu ses</label>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <input id="safe-happy-volume" type="range" min="0" max="1" step="0.01" value="${s.happyVolume}">
-        <span id="safe-happy-volume-val">${s.happyVolume.toFixed(2)}</span>
       </div>
       <label>HUD coin font</label>
       <div style="display:flex;align-items:center;gap:8px;">
@@ -1351,16 +1034,6 @@
         <option value="pnl-desc" ${s.hudPnlSort === 'pnl-desc' ? 'selected' : ''}>PnL: yüksek → düşük</option>
         <option value="pnl-asc" ${s.hudPnlSort === 'pnl-asc' ? 'selected' : ''}>PnL: düşük → yüksek</option>
       </select>
-      <label>Kritik eşik</label>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <input id="safe-severe-start" type="range" min="500" max="3000" step="50" value="${s.severeStart}">
-        <span id="safe-severe-start-val">${s.severeStart}</span>
-      </div>
-      <label>Alt limit keskin alarm (≤ kademe USD)</label>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <input id="safe-subprime-below" type="range" min="500" max="8000" step="50" value="${Number.isFinite(s.subprimeAlarmBelowUsd) ? s.subprimeAlarmBelowUsd : 3000}">
-        <span id="safe-subprime-below-val">${Number.isFinite(s.subprimeAlarmBelowUsd) ? s.subprimeAlarmBelowUsd : 3000}</span>
-      </div>
     </div>`;
   }
 
@@ -1442,7 +1115,7 @@
 
   function readStoredSettings() {
     try {
-      return { ...defaults, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') };
+      return normalizeSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'));
     } catch {
       return { ...defaults };
     }
@@ -1576,7 +1249,7 @@
     comp.connect(ctx.destination);
 
     if (msg.sound === 'happy') {
-      const vol = volume ?? Math.max(0.0001, Math.min(1, Number(s.happyVolume) || Number(s.smallAlarmVolume) || 0.06));
+      const vol = volume ?? Math.max(0.0001, Math.min(1, Number(s.smallAlarmVolume) || 0.06));
       [520, 780, 1120].forEach((freq, i) => {
         const osc = ctx.createOscillator();
         const g = ctx.createGain();
@@ -1609,7 +1282,7 @@
     }
     stopLocalSevereVoicesNow();
     const tier = msg.tier === 'sub3000' ? 'sub3000' : msg.tier === 'critical' ? 'critical' : 'simple';
-    const vol = volume ?? Math.max(0.0001, Math.min(1, Number(s.severeVolume) || Number(s.bigAlarmVolume) || 0.08));
+    const vol = volume ?? Math.max(0.0001, Math.min(1, Number(s.bigAlarmVolume) || 0.08));
     const intM = Math.min(2.8, Math.max(0.55, Number(msg.intensityMul) || (tier === 'simple' ? 0.8 : 1.4)));
     const durM = Math.min(2.4, Math.max(0.65, Number(msg.durationMul) || 1));
     const count = tier === 'sub3000' ? Math.round(110 * durM) : tier === 'critical' ? Math.round(58 * durM) : Math.round(16 * durM);
@@ -1652,7 +1325,7 @@
   function createMainSettingsPanel() {
     document.getElementById('safe-hud-main-settings-wrap')?.remove();
     loadSettingsIntoSettings();
-    const s = { ...defaults, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') };
+    const s = readStoredSettings();
     injectMainChromeStyles(document);
 
     const wrap = document.createElement('div');
@@ -1689,7 +1362,7 @@
 
     const readMainPanelSettings = () => {
       try {
-        return { ...defaults, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') };
+        return normalizeSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'));
       } catch {
         return { ...defaults };
       }
@@ -1720,8 +1393,6 @@
       };
     };
     bindCheckMain('safe-hide-originals', 'hideOriginals');
-    bindCheckMain('safe-severe-enabled', 'severeEnabled');
-    bindCheckMain('safe-happy-enabled', 'happyEnabled');
     bindCheckMain('safe-small-up-enabled', 'smallUpEnabled');
     bindCheckMain('safe-small-down-enabled', 'smallDownEnabled');
     bindCheckMain('safe-big-up-enabled', 'bigUpEnabled');
@@ -1732,11 +1403,10 @@
       const st = readMainPanelSettings();
       const el = document.getElementById('safe-alarm-summary');
       if (!el) return;
-      const mode = st.alarmEngineMode === 'legacy' ? 'Eski grid aktif.' : 'Sistematik mod aktif.';
       const small = `Ufak: +${st.smallUpUsd || 25} / -${st.smallDownUsd || 25} USD`;
       const big = `Büyük: +${st.bigUpUsd || 100} / -${st.bigDownUsd || 100} USD`;
       const critical = `Kritik: son ${Math.round((st.criticalRollingWindowMs || 60000) / 1000)} sn içinde -${st.criticalDropUsd || 180} USD`;
-      el.textContent = `${mode} ${small}. ${big}. ${critical}. Aynı eşik, fiyat ${st.rearmOffset || 5} USD geri toparlanmadan tekrar çalmaz.`;
+      el.textContent = `${small}. ${big}. ${critical}. Aynı eşik, fiyat ${st.rearmOffset || 5} USD geri toparlanmadan tekrar çalmaz.`;
     };
 
     const bindAlarmNumberMain = (id, key) => {
@@ -1761,20 +1431,6 @@
     bindAlarmNumberMain('safe-big-up-usd', 'bigUpUsd');
     bindAlarmNumberMain('safe-big-down-usd', 'bigDownUsd');
     bindAlarmNumberMain('safe-critical-drop-usd', 'criticalDropUsd');
-
-    const alarmModeEl = document.getElementById('safe-alarm-engine-mode');
-    if (alarmModeEl) {
-      alarmModeEl.onchange = () => {
-        const st = readMainPanelSettings();
-        st.alarmEngineMode = alarmModeEl.value;
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-        state.movementLatchedLevels.clear();
-        state.alarmCooldownUntil = {};
-        state.criticalDropLatched = false;
-        updateAlarmSummary();
-        notifyHudSettingsChanged();
-      };
-    }
 
     const hudSurfaceEl = document.getElementById('safe-hud-surface');
     if (hudSurfaceEl) {
@@ -1842,20 +1498,6 @@
       }
     });
 
-    document.getElementById('safe-severe-volume').oninput = (e) => {
-      const st = readMainPanelSettings();
-      st.severeVolume = parseFloat(e.target.value);
-      document.getElementById('safe-severe-volume-val').textContent = st.severeVolume.toFixed(2);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-      notifyHudSettingsChanged();
-    };
-    document.getElementById('safe-happy-volume').oninput = (e) => {
-      const st = readMainPanelSettings();
-      st.happyVolume = parseFloat(e.target.value);
-      document.getElementById('safe-happy-volume-val').textContent = st.happyVolume.toFixed(2);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-      notifyHudSettingsChanged();
-    };
     const bindFloatRangeMain = (id, key, digits = 2) => {
       const el = document.getElementById(id);
       if (!el) return;
@@ -1885,76 +1527,12 @@
         notifyHudSettingsChanged();
       };
     }
-    document.getElementById('safe-happy-buffer').oninput = (e) => {
-      const st = readMainPanelSettings();
-      st.happyUpBufferUsd = parseInt(e.target.value, 10);
-      document.getElementById('safe-happy-buffer-val').textContent = String(st.happyUpBufferUsd);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-      notifyHudSettingsChanged();
-    };
-
-    document.getElementById('safe-drop-confirm').oninput = (e) => {
-      const st = readMainPanelSettings();
-      st.dropConfirmUsd = parseInt(e.target.value, 10);
-      document.getElementById('safe-drop-confirm-val').textContent = String(st.dropConfirmUsd);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-      notifyHudSettingsChanged();
-    };
-    document.getElementById('safe-min-consecutive-down').oninput = (e) => {
-      const st = readMainPanelSettings();
-      st.minConsecutiveDown = parseInt(e.target.value, 10);
-      document.getElementById('safe-min-consecutive-down-val').textContent = String(st.minConsecutiveDown);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-      notifyHudSettingsChanged();
-    };
-    document.getElementById('safe-happy-cooldown').oninput = (e) => {
-      const st = readMainPanelSettings();
-      const sec = parseInt(e.target.value, 10);
-      st.happyCooldownMs = Math.max(0, sec) * 1000;
-      document.getElementById('safe-happy-cooldown-val').textContent = String(Math.max(0, sec));
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-      notifyHudSettingsChanged();
-    };
-    document.getElementById('safe-severe-step').oninput = (e) => {
-      const st = readMainPanelSettings();
-      st.severeStep = parseInt(e.target.value, 10);
-      document.getElementById('safe-severe-step-val').textContent = String(st.severeStep);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-      try {
-        if (window.safeHudRearmFromSevereSlider) window.safeHudRearmFromSevereSlider();
-      } catch (err) {}
-      notifyHudSettingsChanged();
-    };
     document.getElementById('safe-rearm-offset').oninput = (e) => {
       const st = readMainPanelSettings();
       st.rearmOffset = parseInt(e.target.value, 10);
       document.getElementById('safe-rearm-offset-val').textContent = String(st.rearmOffset);
       localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-      try {
-        if (window.safeHudRearmFromSevereSlider) window.safeHudRearmFromSevereSlider();
-      } catch (err2) {}
       updateAlarmSummary();
-      notifyHudSettingsChanged();
-    };
-
-    document.getElementById('safe-severe-start').oninput = (e) => {
-      const st = readMainPanelSettings();
-      st.severeStart = parseInt(e.target.value, 10);
-      document.getElementById('safe-severe-start-val').textContent = String(st.severeStart);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-      try {
-        if (window.safeHudRearmFromSevereSlider) window.safeHudRearmFromSevereSlider();
-      } catch (err) {}
-      notifyHudSettingsChanged();
-    };
-    document.getElementById('safe-subprime-below').oninput = (e) => {
-      const st = readMainPanelSettings();
-      st.subprimeAlarmBelowUsd = parseInt(e.target.value, 10);
-      document.getElementById('safe-subprime-below-val').textContent = String(st.subprimeAlarmBelowUsd);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
-      try {
-        if (window.safeHudRearmFromSevereSlider) window.safeHudRearmFromSevereSlider();
-      } catch (errSp) {}
       notifyHudSettingsChanged();
     };
 
@@ -2104,7 +1682,7 @@
 
     function readSettings() {
       try {
-        return { ...defaults, ...JSON.parse(win.localStorage.getItem(STORAGE_KEY) || '{}') };
+        return normalizeSettings(JSON.parse(win.localStorage.getItem(STORAGE_KEY) || '{}'));
       } catch {
         return { ...defaults };
       }
@@ -2128,7 +1706,6 @@
      * @param opts.tier - sub3000 | critical | simple (yok + quickRepeat yok → critical)
      */
     function playSevere(s, opts = {}) {
-      if (!s.severeEnabled) return;
       const ctx = getAudioCtx();
       if (!ctx) return;
 
@@ -2144,8 +1721,8 @@
       const baseVol = Number.isFinite(overrideVol)
         ? Math.max(0.0001, Math.min(1, overrideVol))
         : opts.useHappyVolume
-        ? Math.max(0.0001, Math.min(1, Number(s.happyVolume) || 0.06))
-        : Math.max(0.0001, Math.min(1, Number(s.severeVolume) || 0.06));
+        ? Math.max(0.0001, Math.min(1, Number(s.smallAlarmVolume) || 0.06))
+        : Math.max(0.0001, Math.min(1, Number(s.bigAlarmVolume) || 0.08));
 
       const intBase = Math.min(2.5, Math.max(0.5, Number(opts.intensityMul) || 1));
       const durBase = Math.min(2.2, Math.max(0.85, Number(opts.durationMul) || 1));
@@ -2272,14 +1849,13 @@
      * @description Yükseliş sesi: kısa, daha yumuşak ve yukarı kayan ton.
      */
     function playHappy(s, opts = {}) {
-      if (!s.happyEnabled) return;
       const ctx = getAudioCtx();
       if (!ctx) return;
 
       const overrideVol = Number(opts.volumeOverride);
       const vol = Number.isFinite(overrideVol)
         ? Math.max(0.0001, Math.min(1, overrideVol))
-        : Math.max(0.0001, Math.min(1, Number(s.happyVolume) || 0.06));
+        : Math.max(0.0001, Math.min(1, Number(s.smallAlarmVolume) || 0.06));
       const start = ctx.currentTime;
       const comp = compressor(ctx, -18, 8);
       const master = ctx.createGain();
@@ -2729,10 +2305,7 @@
 
     if (state.lastWalletPrice === null) {
       state.lastWalletPrice = currentPrice;
-      updateArmedLevels(currentPrice);
     } else {
-      updateArmedLevels(currentPrice);
-      bumpConsecutiveDownStreak(state.lastWalletPrice, currentPrice);
       checkSystematicMovementAlarms(state.lastWalletPrice, currentPrice);
       state.lastWalletPrice = currentPrice;
     }
@@ -2836,13 +2409,9 @@
     state.pendingSounds.length = 0;
     state.severePlaybackUntil = 0;
     state.priceHistory.length = 0;
-    state.happyLatchedThresholds.clear();
-    state.severeAwaitDepth.clear();
     state.movementLatchedLevels.clear();
     state.alarmCooldownUntil = {};
     state.criticalDropLatched = false;
-    state.consecutiveDownStreak = 0;
-    state.lastHappyGlobalAt = 0;
     state.criticalVoiceUntil = 0;
     resetWalletFlatWatch();
   }
@@ -2885,7 +2454,6 @@
       }
     } catch (e) {}
     state.hudWindow = null;
-    delete window.safeHudRearmFromSevereSlider;
     delete window.safeHudInvalidateDom;
     delete window.safeHudGetSevereTestScaling;
   };
