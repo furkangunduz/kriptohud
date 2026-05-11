@@ -10,14 +10,9 @@
     SETTINGS_CHANGED: 'SAFE_HUD_SETTINGS_CHANGED',
   };
 
-  /** Ağır alarm sekansı bitene kadar (ms) — fiyat yukarı dönünce susturmak için; süre çarpanı ile uzar */
   const SEVERE_PLAYBACK_WINDOW_MS = 14000;
-
-  /** Kayar pencere: son 1 dakikadaki zirveden bugüne düşüş (USD) alarm şiddetini belirler */
   const PRICE_ROLLING_WINDOW_MS = 1 * 60 * 1000;
-  /** Cüzdan sayısı bu kadar ms değişmezse tek seferlik uyarı */
   const WALLET_FLAT_STALE_MS = 60 * 1000;
-  /** Bu düşüşte tam “güçlü” ölçek kabul edilir (üstü daha da artar, tavan kodda) */
   const SEVERE_DROP_REF_USD = 200;
 
   /**
@@ -80,12 +75,10 @@
     coinSelector: '',
     pnlSelector: '',
 
-    /** @description HUD pozisyon sırası: none | pnl-desc (kârdan zarara) | pnl-asc (zarardan kara) */
     hudPnlSort: 'pnl-desc',
 
-    /** @description Ofis: görev çubuğu başlığı ve sade görünüm */
     privacyOfficeMode: false,
-    /** @description Gizlilikte coin yerine Kalem 1, Kalem 2… */
+
     maskRowLabels: true,
     discreetWindowTitle: 'Çalışma özeti',
   };
@@ -117,30 +110,29 @@
     timer: null,
     lastWalletPrice: null,
     hudWindow: null,
-    /** @description true iken veri döngüsü popup penceresinde çalışır (ana sekme arka planda kısılsa bile). */
     popupPollsOpener: false,
     pendingSounds: [],
     popupWinRef: null,
-    /** @description performance.now() — ağır alarm çalarken fiyat yukarı çıkınca susturulur */
+
     severePlaybackUntil: 0,
-    /** @description { t: epochMs, p: number } — son ~1 dk+ cüzdan örnekleri */
+
     priceHistory: [],
-    /** @description 100 USD kritik alarm bitene kadar fiyat yukarı gelse bile STOP gönderilmez */
+
     criticalVoiceUntil: 0,
-    /** @description Durgunluk alarmı: son görülen cüzdan USD (aynı kaldı mı diye) */
+
     walletFlatAnchorPrice: null,
-    /** @description epoch ms — walletFlatAnchorPrice bu fiyata oturduğu an */
+
     walletFlatAnchorAt: 0,
-    /** @description Bu fiyat bandında durgunluk sesi bir kez çalındı; fiyat değişene kadar tekrar yok */
     walletFlatAlarmed: false,
-    /** @description Sistematik alarm profilleri için tekrar engeli: profile:direction:level */
     movementLatchedLevels: new Set(),
-    /** @description Profil bazlı cooldown zamanları */
     alarmCooldownUntil: {},
-    /** @description Kritik düşüş, fiyat toparlanmadan tekrar etmesin */
     criticalDropLatched: false,
     inlineHudEl: null,
   };
+
+  function save() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(normalizeSettings(settings)));
+  }
 
   function qs(sel) {
     if (!sel || !String(sel).trim()) return null;
@@ -210,7 +202,6 @@
     return t || '-';
   }
 
-  /** @description HUD’da renk işaret ettiği için + / - karakterlerini göstermez. */
   function formatHudStripSignChars(raw) {
     const t = String(raw ?? '').trim();
     if (!t || t === '-') return '';
@@ -661,8 +652,7 @@
       return true;
     }
 
-    const intensityMul =
-      cooldownKey === 'critical' ? 2.35 : cooldownKey === 'big' ? 1.45 : Math.max(0.7, Math.min(1.1, vol / 0.06));
+    const intensityMul = cooldownKey === 'critical' ? 2.35 : cooldownKey === 'big' ? 1.45 : Math.max(0.7, Math.min(1.1, vol / 0.06));
     const durationMul = cooldownKey === 'critical' ? 2.1 : cooldownKey === 'big' ? 1.3 : 0.75;
     const tier = profile.tier || (cooldownKey === 'critical' ? 'sub3000' : cooldownKey === 'big' ? 'critical' : 'simple');
     if ((settings.hudSurface || 'popup') === 'inline' && !state.popupPollsOpener) {
@@ -1155,7 +1145,17 @@
         const rightWrap = document.createElement('div');
         rightWrap.className = 'sh-row-right';
         const pnl = document.createElement('div');
-        const tone = privacy ? (pnlNum > 0 ? 'sh-tone-office-pos' : pnlNum < 0 ? 'sh-tone-office-neg' : 'sh-tone-office') : pnlNum > 0 ? 'sh-tone-up' : pnlNum < 0 ? 'sh-tone-down' : 'sh-tone-neu';
+        const tone = privacy
+          ? pnlNum > 0
+            ? 'sh-tone-office-pos'
+            : pnlNum < 0
+              ? 'sh-tone-office-neg'
+              : 'sh-tone-office'
+          : pnlNum > 0
+            ? 'sh-tone-up'
+            : pnlNum < 0
+              ? 'sh-tone-down'
+              : 'sh-tone-neu';
         pnl.textContent = formatHudStripSignChars(pos.pnl);
         pnl.className = `sh-row-pnl ${tone}`;
         pnl.style.fontSize = `${s.hudPnlFontSize}px`;
@@ -1650,7 +1650,7 @@
 
     const audioState = {
       ctx: null,
-      /** @description performance.now() — ağır alarm üst üste binmesin */
+
       severeCooldownUntil: 0,
       severeStopHandles: [],
     };
@@ -1721,8 +1721,8 @@
       const baseVol = Number.isFinite(overrideVol)
         ? Math.max(0.0001, Math.min(1, overrideVol))
         : opts.useHappyVolume
-        ? Math.max(0.0001, Math.min(1, Number(s.smallAlarmVolume) || 0.06))
-        : Math.max(0.0001, Math.min(1, Number(s.bigAlarmVolume) || 0.08));
+          ? Math.max(0.0001, Math.min(1, Number(s.smallAlarmVolume) || 0.06))
+          : Math.max(0.0001, Math.min(1, Number(s.bigAlarmVolume) || 0.08));
 
       const intBase = Math.min(2.5, Math.max(0.5, Number(opts.intensityMul) || 1));
       const durBase = Math.min(2.2, Math.max(0.85, Number(opts.durationMul) || 1));
@@ -2076,7 +2076,6 @@
     } catch (e) {}
   }
 
-  /** Sabit isim: aynı hedefi yeniden kullanır; bazı tarayıcılarda engel oranını düşürür. */
   const POPUP_WINDOW_NAME = 'FairGridSafeHUD';
 
   /**
@@ -2388,7 +2387,7 @@
       } catch (e) {}
     };
     run();
-    /** Popup üzerindeki timer: ana sekme minimize/throttle olsa bile çalışır. */
+
     popupWin.__safeHudPopupPollTimer = popupWin.setInterval(run, 400);
   };
 
